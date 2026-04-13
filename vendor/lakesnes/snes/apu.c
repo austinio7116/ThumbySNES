@@ -198,19 +198,19 @@ void apu_write(Apu* apu, uint16_t adr, uint8_t val) {
   apu->ram[adr] = val;
 }
 
-uint8_t apu_spcRead(void* mem, uint16_t adr) {
+LAKESNES_HOT uint8_t apu_spcRead(void* mem, uint16_t adr) {
   Apu* apu = (Apu*) mem;
   apu_cycle(apu);
   return apu_read(apu, adr);
 }
 
-void apu_spcWrite(void* mem, uint16_t adr, uint8_t val) {
+LAKESNES_HOT void apu_spcWrite(void* mem, uint16_t adr, uint8_t val) {
   Apu* apu = (Apu*) mem;
   apu_cycle(apu);
   apu_write(apu, adr, val);
 }
 
-void apu_spcIdle(void* mem, bool waiting) {
+LAKESNES_HOT void apu_spcIdle(void* mem, bool waiting) {
   Apu* apu = (Apu*) mem;
   apu_cycle(apu);
 }

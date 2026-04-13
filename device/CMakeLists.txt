@@ -53,6 +53,10 @@ if(THUMBYSNES_LINK_CORE)
         # which the Pico SDK linker copies to SRAM at boot. Avoids flash
         # XIP cache misses on the inner emulator loop.
         LAKESNES_HOT_SRAM=1
+        # Dual-core: SPC700 + DSP run on core 1, CPU + PPU on core 0.
+        # snes_catchupApu compiles to a no-op; snes_apu_core1_loop is
+        # the core 1 entry point.
+        THUMBYSNES_DUAL_CORE=1
     )
     target_compile_options(lakesnes_dev PRIVATE
         -O3 -fomit-frame-pointer -fstrict-aliasing
@@ -105,6 +109,7 @@ target_link_libraries(snesrun_device PRIVATE
     hardware_adc
     tinyusb_device
     tinyusb_board
+    pico_multicore
 )
 if(THUMBYSNES_LINK_CORE)
     target_link_libraries(snesrun_device PRIVATE lakesnes_dev)

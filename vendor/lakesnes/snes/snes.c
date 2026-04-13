@@ -153,7 +153,12 @@ void snes_syncCycles(Snes* snes, bool start, int syncCycles) {
 }
 
 LAKESNES_HOT static void snes_runCycle(Snes* snes) {
+#if !(defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
+  /* Dual-core build: APU runs free on core 1, no per-master-cycle
+   * accumulator update needed. Save the FPU multiply + add per tick
+   * (this runs millions of times per frame). */
   snes->apuCatchupCycles += (snes->palTiming ? apuCyclesPerMasterPal : apuCyclesPerMaster) * 2.0f;
+#endif
   snes->cycles += 2;
   // check for h/v timer irq's
   bool condition = (
@@ -234,6 +239,15 @@ LAKESNES_HOT static void snes_runCycle(Snes* snes) {
 }
 
 static void snes_catchupApu(Snes* snes) {
+#if defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
+  /* Dual-core build: SPC700 + DSP run continuously on core 1. CPU-side
+   * APU port accesses only need to read the shared inPorts/outPorts
+   * bytes, which are atomic on M33. No explicit catchup needed — the
+   * SPC has been running all along. The accumulator field is unused
+   * in this configuration. */
+  (void)snes;
+  return;
+#else
   /* ThumbySNES: run SPC opcodes while the accumulator has any work in
    * it, not just the integer portion. Upstream casts the accumulator to
    * int before passing to apu_runCycles — on tight CPU polling loops
@@ -252,6 +266,7 @@ static void snes_catchupApu(Snes* snes) {
     if (ran == 0) break; /* safety — should never happen */
     snes->apuCatchupCycles -= (float) ran;
   }
+#endif
 }
 
 static void snes_doAutoJoypad(Snes* snes) {

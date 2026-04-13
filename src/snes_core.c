@@ -36,6 +36,13 @@ static Snes      *s_snes = NULL;
 static int        s_loaded = 0;
 static uint16_t   s_pad1 = 0;
 
+/* Dual-core APU: core 1 reads this pointer in a tight loop and runs
+ * SPC opcodes when it's non-NULL. Updated by snes_load / snes_unload
+ * on core 0. `volatile` because both cores touch it — byte pointers
+ * are atomic on M33 but the compiler must not hoist the load out of
+ * the core 1 loop. */
+static Snes * volatile s_apu_core1_snes = NULL; /* unused on host */
+
 /* Native-LCD mode state. `s_lcd_fb` holds the client's framebuffer so
  * we can re-install it after a frameskipped frame, and so snes_unload
  * can clear it cleanly. */
@@ -69,22 +76,14 @@ enum {
     LK_BTN_B     = 15,
 };
 
-/* Convert one BGR_BGR_ scanline (the format ppu_handlePixel writes —
- * 8 bytes per pixel for a future hires path; we read the first 3 of
- * each 8-byte slot) into 256 RGB565 pixels at row Y of the host fb. */
-static void default_scanline_cb(void *user, int line, const uint8_t *src)
+/* Default scanline sink for the RGB565 fast-path callback: plain
+ * memcpy into the 256×224 host framebuffer. snes_get_framebuffer
+ * hands that buffer to callers. */
+static void default_scanline_cb_rgb565(void *user, int line, const uint16_t *src)
 {
     (void)user;
     if (line < 1 || line > 224) return;
-    uint16_t *dst = s_default_fb + (line - 1) * 256;
-    /* pixelOutputFormat = BGRX (default): byte 0 = B, 1 = G, 2 = R. */
-    for (int x = 0; x < 256; x++) {
-        const uint8_t *p = src + x * 8;
-        uint8_t b = p[0], g = p[1], r = p[2];
-        dst[x] = ((uint16_t)(r >> 3) << 11)
-               | ((uint16_t)(g >> 2) <<  5)
-               |  (uint16_t)(b >> 3);
-    }
+    memcpy(s_default_fb + (line - 1) * 256, src, 256 * sizeof(uint16_t));
 }
 
 static int snes_emu_init(void)
@@ -92,11 +91,10 @@ static int snes_emu_init(void)
     if (s_snes) return 1;
     s_snes = snes_init();
     if (!s_snes) return 0;
-    /* Force XBGR layout (B=byte0, G=byte1, R=byte2, X=byte3 within each
-     * 4-byte half-pixel slot) so default_scanline_cb's p[0/1/2] reads
-     * line up. ppu_init defaults to BGRX which shifts everything by 1. */
-    ppu_setPixelOutputFormat(s_snes->ppu, ppu_pixelOutputFormatXBGR);
-    ppu_setScanlineCallback(s_snes->ppu, default_scanline_cb, NULL);
+    /* Install the RGB565 fast-path callback as the default. Frontends
+     * that want raw BGRX pixelBuffer can override via
+     * snes_set_scanline_cb(). */
+    ppu_setScanlineCbRgb565(s_snes->ppu, default_scanline_cb_rgb565, NULL);
     return 1;
 }
 
@@ -109,6 +107,9 @@ static snes_result_t snes_load_common(const uint8_t *rom, size_t rom_len, int xi
         return SNES_ERR_BAD_ROM;
     }
     s_loaded = 1;
+    /* Release the shared snes pointer to core 1. From this point core 1
+     * will begin executing spc_runOpcode in a tight loop. */
+    s_apu_core1_snes = s_snes;
     return SNES_OK;
 }
 
@@ -141,6 +142,12 @@ snes_result_t snes_run_frame(void)
 
 void snes_unload(void)
 {
+    /* Park core 1 first so it stops poking at snes->apu while we
+     * free it. A sync barrier here would be ideal; on M33 pointer
+     * writes are atomic and core 1's loop re-reads this every
+     * iteration, so the window where it sees a stale pointer is a
+     * single opcode. Good enough. */
+    s_apu_core1_snes = NULL;
     if (s_snes) {
         snes_free(s_snes);
         s_snes = NULL;
@@ -202,6 +209,41 @@ void snes_set_pad(uint16_t pad_bits)
 void snes_set_scanline_cb(void (*cb)(void*, int, const uint8_t*), void *user)
 {
     if (s_snes) ppu_setScanlineCallback(s_snes->ppu, cb, user);
+}
+
+void snes_set_scanline_cb_rgb565(void (*cb)(void*, int, const uint16_t*), void *user)
+{
+    if (s_snes) ppu_setScanlineCbRgb565(s_snes->ppu, cb, user);
+}
+
+/* Dual-core APU entry point. Core 1 calls this once at boot on the
+ * device build; on host it's a no-op (host keeps the classic
+ * snes_catchupApu path). Runs SPC opcodes at the M33's natural rate —
+ * that's roughly real-time for the SPC's 1.024 MHz — while core 0
+ * handles CPU + PPU + LCD. CPU-side snes_catchupApu is compiled to a
+ * no-op on device so the bus hot path loses the per-access SPC
+ * catchup overhead. */
+void snes_apu_core1_loop(void)
+{
+#if defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
+    for (;;) {
+        Snes *s = s_apu_core1_snes;
+        if (!s) {
+            /* No ROM loaded — idle without burning 100% CPU. A tight
+             * "cmp + branch" is fine on M33 while waiting for core 0 to
+             * populate the pointer. */
+            __asm__ volatile ("nop");
+            continue;
+        }
+        /* One SPC opcode per iteration. spc_runOpcode advances apu
+         * cycles + ticks DSP + timers internally. Core 1 runs free —
+         * no cycle coupling to CPU. */
+        spc_runOpcode(s->apu->spc);
+    }
+#else
+    /* Host / single-core build: this shouldn't ever be called. */
+    return;
+#endif
 }
 
 void snes_set_skip_color_math(int enable)
@@ -312,6 +354,8 @@ void          snes_get_framebuffer(uint16_t *dst)                 { if (dst) mem
 size_t        snes_get_audio(int16_t *dst, size_t frames)         { if (dst) memset(dst, 0, frames * 4); return frames; }
 void          snes_set_pad(uint16_t pad_bits)                     { (void)pad_bits; }
 void          snes_set_scanline_cb(void (*cb)(void*, int, const uint8_t*), void *user) { (void)cb; (void)user; }
+void          snes_set_scanline_cb_rgb565(void (*cb)(void*, int, const uint16_t*), void *user) { (void)cb; (void)user; }
+void          snes_apu_core1_loop(void) { }
 void          snes_set_skip_color_math(int enable){ (void)enable; }
 void          snes_set_render_x_range(int s, int e){ (void)s; (void)e; }
 void          snes_set_lcd_mode(uint16_t *fb, int w, int h){ (void)fb; (void)w; (void)h; }

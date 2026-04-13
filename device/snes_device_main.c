@@ -20,6 +20,7 @@
 
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "pico/multicore.h"
 #include "hardware/clocks.h"
 #include "tusb.h"
 #include "ff.h"
@@ -33,6 +34,17 @@
 #include "snes_font.h"
 #include "snes_run.h"
 #include "snes_battery.h"
+
+#if THUMBYSNES_HAVE_CORE
+#include "snes_core.h"
+
+/* Core 1 entry — parks in snes_apu_core1_loop. When a ROM is loaded
+ * via snes_load*, the core1 loop picks up the shared snes pointer and
+ * starts running spc_runOpcode continuously. CPU + PPU stay on core 0. */
+static void core1_apu_entry(void) {
+    snes_apu_core1_loop();
+}
+#endif
 
 #define THUMBYSNES_VERSION "0.1"
 #define FB_W 128
@@ -119,6 +131,13 @@ int main(void) {
     }
     splash(0x07E0, "ready");
     sleep_ms(200);
+
+#if THUMBYSNES_HAVE_CORE
+    /* Launch core 1 for SPC700 + DSP. It parks until a ROM is loaded,
+     * then runs SPC opcodes continuously while core 0 handles
+     * CPU + PPU + LCD + USB. */
+    multicore_launch_core1(core1_apu_entry);
+#endif
 
     while (1) {
         int n = snes_picker_scan(g_roms, SNES_PICKER_MAX_ROMS);

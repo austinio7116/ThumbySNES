@@ -139,6 +139,26 @@ struct Ppu {
   void  (*scanlineCb)(void* user, int line, const uint8_t* lineBuffer);
   void   *scanlineUser;
 
+  /* ThumbySNES per-line RGB565 scanline output.
+   *
+   * Modern fast path (preferred over the BGRX pixelBuffer flow above).
+   * ppu_runLine builds a fully composited 256-pixel RGB565 line via
+   * tight per-slot passes (bottom-up over layerPerMode, overwriting
+   * non-zero pixels), then hands it to `scanlineCbRgb565`. The
+   * frontend consumes RGB565 directly — no BGRX-byte conversion, no
+   * per-pixel channel math, no subscreen duplication.
+   *
+   * Compared to the per-pixel ppu_handlePixel path:
+   *   - 8× less scanline memory traffic (2 bytes/pixel vs 16),
+   *   - per-pixel channel-scale + brightness math collapsed to a
+   *     single cgramRgb565[] lookup,
+   *   - layer iteration collapses from O(slots × pixels) with
+   *     function-call-per-pixel window checks to O(slots + pixels)
+   *     with per-slot window-mask precompute. */
+  uint16_t lineRgb565[256];
+  void  (*scanlineCbRgb565)(void* user, int line, const uint16_t* line565);
+  void   *scanlineUserRgb565;
+
   /* ThumbySNES per-line BG render cache.
    *
    * Upstream's ppu_getPixel is called once per pixel per layer slot
@@ -158,6 +178,13 @@ struct Ppu {
    * old per-pixel ppu_getPixelForBgLayer path. */
   uint8_t bgLine[4][2][256];
   uint8_t bgLineCacheValid[4];
+
+  /* Per-priority "contains any non-zero pixel" flag set by
+   * ppu_renderBgLine. Lets the compositor skip slots that are fully
+   * transparent for this line (common — e.g. BG3 water tint / BG2
+   * during screens where only BG1 + sprites are in use). Saves a
+   * full 256-wide pass per skipped slot. */
+  uint8_t bgLineNonEmpty[4][2];
 
   /* ThumbySNES: when set, ppu_handlePixel forces mathEnabled = false
    * for every pixel — skips the recursive subscreen fetch and the
@@ -235,6 +262,15 @@ void ppu_putPixels(Ppu* ppu, uint8_t* pixels);   /* legacy stub — see ppu.c */
 void ppu_setPixelOutputFormat(Ppu* ppu, int pixelOutputFormat);
 void ppu_setScanlineCallback(Ppu* ppu,
                              void (*cb)(void*, int, const uint8_t*),
+                             void *user);
+
+/* ThumbySNES: install an RGB565 per-line callback. When non-NULL,
+ * ppu_runLine uses the per-line full-composite fast path and fires
+ * this cb with the 256-pixel RGB565 line. Mutually exclusive with
+ * the classic scanlineCb (the RGB565 path takes precedence — setting
+ * both is a no-op for the BGRX callback). */
+void ppu_setScanlineCbRgb565(Ppu* ppu,
+                             void (*cb)(void*, int, const uint16_t*),
                              void *user);
 
 /* ThumbySNES: enable native-LCD rendering. `lcdFb` is a W×H RGB565

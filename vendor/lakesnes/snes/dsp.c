@@ -8,6 +8,7 @@
 #include "dsp.h"
 #include "apu.h"
 #include "statehandler.h"
+#include "perf.h"
 
 static const int rateValues[32] = {
   0, 2048, 1536, 1280, 1024, 768, 640, 512,
@@ -182,7 +183,7 @@ void dsp_handleState(Dsp* dsp, StateHandler* sh) {
   sh_handleByteArray(sh, dsp->ram, 0x80);
 }
 
-void dsp_cycle(Dsp* dsp) {
+LAKESNES_HOT void dsp_cycle(Dsp* dsp) {
   dsp->sampleOutL = 0;
   dsp->sampleOutR = 0;
   dsp->echoOutL = 0;

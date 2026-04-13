@@ -53,8 +53,13 @@ static uint16_t *s_lcd_target = NULL;
 static uint16_t  s_blend_a[FB_W];
 static int       s_blend_a_dev_y = -1;
 
+/* RGB565 scanline callback. Input is a 256-pixel fully composited
+ * line from the PPU's per-line compositor (cgramRgb565 with brightness
+ * baked in — no channel math here). We FILL-crop 16 px off each side,
+ * 7:4-stride down to 128 px, horizontal-blend pairs, then vertical-
+ * blend the pair of SNES lines that map to each device row. */
 static void __attribute__((section(".time_critical.snes_blit")))
-    on_scanline(void *user, int line, const uint8_t *lineBuffer)
+    on_scanline_565(void *user, int line, const uint16_t *line565)
 {
     (void)user;
     if (line < 1 || line > 224) return;
@@ -66,12 +71,7 @@ static void __attribute__((section(".time_critical.snes_blit")))
     for (int ox = 0; ox < FB_W; ox++) {
         int sx  = ((ox * 7) >> 2) + FILL_X_CROP;
         int sx2 = sx + 1; if (sx2 > FILL_X_CROP + FILL_SRC - 1) sx2 = FILL_X_CROP + FILL_SRC - 1;
-        const uint8_t *p1 = lineBuffer + sx  * 8;
-        const uint8_t *p2 = lineBuffer + sx2 * 8;
-        /* XBGR layout (ppu_pixelOutputFormatXBGR): byte0 = B, 1 = G, 2 = R, 3 = X. */
-        uint16_t c1 = (uint16_t)(((uint16_t)(p1[2] >> 3) << 11) | ((uint16_t)(p1[1] >> 2) << 5) | (uint16_t)(p1[0] >> 3));
-        uint16_t c2 = (uint16_t)(((uint16_t)(p2[2] >> 3) << 11) | ((uint16_t)(p2[1] >> 2) << 5) | (uint16_t)(p2[0] >> 3));
-        row_blended[ox] = rgb565_avg2(c1, c2);
+        row_blended[ox] = rgb565_avg2(line565[sx], line565[sx2]);
     }
 
     if (s_blend_a_dev_y == dev_y) {
@@ -154,13 +154,18 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
 
     s_lcd_target = fb;
     s_blend_a_dev_y = -1;
-    snes_set_scanline_cb(on_scanline, NULL);
+    /* RGB565 fast-path callback — PPU composites whole lines via
+     * cgramRgb565 with brightness baked in, so this path does zero
+     * per-pixel channel math (just 2×2 blends + FILL 7:4 subsample). */
+    snes_set_scanline_cb_rgb565(on_scanline_565, NULL);
     /* Performance: skip subscreen / colour-math fetch. Loses HUD fade
      * effects + transparency but cuts per-pixel work nearly in half. */
     snes_set_skip_color_math(1);
-    /* FILL mode crops 16 px off each horizontal edge — tell PPU to
-     * skip those pixels instead of rendering them and discarding. */
-    snes_set_render_x_range(FILL_X_CROP, FILL_X_CROP + FILL_SRC);
+    /* FILL mode crops 16 px off each horizontal edge. The per-line
+     * compositor still renders all 256 columns (its inner loops are
+     * cheaper per-x than the per-pixel walk was, so skipping the 32
+     * cropped cols isn't worth losing the straight-line memory access
+     * pattern). The scanline blend samples only x=16..239. */
 
     /* MENU button: long-press (>= 800 ms) exits to picker. A short
      * press is forwarded as SNES Start. We send Start for the whole

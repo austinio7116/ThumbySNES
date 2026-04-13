@@ -87,6 +87,13 @@ void snes_set_lcd_mode(uint16_t *fb, int w, int h);
  * Only valid in LCD mode (snes_set_lcd_mode) — classic path ignores. */
 void snes_set_frameskip(int skip);
 
+/* Dual-core APU support. On device builds with THUMBYSNES_DUAL_CORE,
+ * CPU + PPU run on core 0 and SPC700 + DSP run on core 1. Core 1
+ * calls snes_apu_core1_loop() once at boot; it polls a shared snes
+ * pointer and runs spc_runOpcode() in a tight loop whenever a ROM
+ * is loaded. Returns only if the device is rebooting. */
+void snes_apu_core1_loop(void);
+
 /* Install a per-scanline output callback (LakeSnes core hooks this
  * via ppu_setScanlineCallback). `cb(user, line, line_buffer)` fires
  * after each visible scanline; `line_buffer` is 256 px × 8 B in BGRX
@@ -94,6 +101,15 @@ void snes_set_frameskip(int skip);
  * snes_get_framebuffer; install your own for direct LCD-blit paths. */
 void snes_set_scanline_cb(void (*cb)(void *user, int line, const uint8_t *line_buffer),
                           void *user);
+
+/* Fast-path scanline callback delivering 256 RGB565 pixels directly
+ * (no BGRX byte stream, no per-pixel channel math in the frontend).
+ * The PPU composites layers once per line via cgramRgb565 lookups
+ * with brightness baked in. Preferred over snes_set_scanline_cb for
+ * any consumer that can use RGB565 directly — e.g. the Thumby Color
+ * device which then 2×2-blends to 128×128. */
+void snes_set_scanline_cb_rgb565(void (*cb)(void *user, int line, const uint16_t *line565),
+                                 void *user);
 
 /* Diagnostic peeks into the live core. Safe to call any time after
  * snes_load*. Returns 0 if no core loaded. */

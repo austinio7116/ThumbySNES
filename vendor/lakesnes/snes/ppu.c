@@ -78,6 +78,9 @@ Ppu* ppu_init(Snes* snes) {
   ppu->snes = snes;
   ppu->scanlineCb = NULL;
   ppu->scanlineUser = NULL;
+  ppu->scanlineCbRgb565 = NULL;
+  ppu->scanlineUserRgb565 = NULL;
+  memset(ppu->lineRgb565, 0, sizeof(ppu->lineRgb565));
   ppu->skipColorMath = false;
   ppu->renderXStart = 0;
   ppu->renderXEnd   = 256;
@@ -292,6 +295,8 @@ LAKESNES_HOT static void ppu_renderBgLine(Ppu* ppu, int layer, int line) {
   // Clear both priority buffers up front.
   memset(ppu->bgLine[layer][0], 0, 256);
   memset(ppu->bgLine[layer][1], 0, 256);
+  ppu->bgLineNonEmpty[layer][0] = 0;
+  ppu->bgLineNonEmpty[layer][1] = 0;
 
   int hScroll = ppu->bgLayer[layer].hScroll;
   int vScroll = ppu->bgLayer[layer].vScroll;
@@ -366,7 +371,10 @@ LAKESNES_HOT static void ppu_renderBgLine(Ppu* ppu, int layer, int line) {
         pixel |= ((plane4 >> col) & 1) << 6;
         pixel |= ((plane4 >> (8 + col)) & 1) << 7;
       }
-      dst[ox] = pixel == 0 ? 0 : (uint8_t)(paletteOffset + pixel);
+      if (pixel != 0) {
+        dst[ox] = (uint8_t)(paletteOffset + pixel);
+        ppu->bgLineNonEmpty[layer][prio ? 1 : 0] = 1;
+      }
     }
 
     outX += 8;
@@ -515,6 +523,125 @@ static uint16_t ppu_composeLcdPixel(Ppu* ppu, const LcdLineCtx *ctx,
   return ppu->cgramRgb565[pixel & 0xff];
 }
 
+/* ThumbySNES per-line full-composite fast path.
+ *
+ * Walks the mode's layer-slot list bottom-up (lowest z-priority first)
+ * and always-overwrites non-zero pixels — net effect is the same as
+ * the classic top-down-with-early-break ppu_getPixel walk, but the
+ * inner loops are tight branch-predictable array operations with no
+ * per-pixel function calls. Produces a fully composited 256-pixel
+ * RGB565 line in `out` in one pass.
+ *
+ * Mode 7 / mosaic / hires (5/6) / OPT (2/4/6) BG layers land in the
+ * slow per-x fallback below. The common mode-1/3/4 games land in the
+ * fast path for all 4 BG layers + sprite slots. */
+static void ppu_composeLineRgb565(Ppu* ppu, int y, uint16_t *out) {
+  if (ppu->cgramDirty) ppu_rebuildCgramCache(ppu);
+  const uint16_t *cg = ppu->cgramRgb565;
+
+  /* Backdrop color fills everywhere first; per-layer passes then
+   * overwrite with their non-transparent pixels. */
+  uint16_t backdrop = cg[0];
+  for (int x = 0; x < 256; x++) out[x] = backdrop;
+
+  if (ppu->forcedBlank) {
+    /* Forced blank is all black regardless of backdrop. */
+    for (int x = 0; x < 256; x++) out[x] = 0;
+    return;
+  }
+
+  int actMode = ppu->mode == 1 && ppu->bg3priority ? 8 : ppu->mode;
+  if (ppu->mode == 7 && ppu->m7extBg) actMode = 9;
+  int n = layerCountPerMode[actMode];
+
+  /* Walk slots bottom-up. layerPerMode is ordered topmost-first, so
+   * iterating in reverse puts the lowest-z slot first and each
+   * subsequent slot correctly overpaints it. */
+  for (int i = n - 1; i >= 0; i--) {
+    int L = layersPerMode[actMode][i];
+    int P = prioritysPerMode[actMode][i];
+    if (L == 5) continue;  /* backdrop slot — already filled */
+    if (!ppu->layer[L].mainScreenEnabled) continue;
+    bool windowed = ppu->layer[L].mainScreenWindowed;
+
+    if (L < 4 && ppu->bgLineCacheValid[L]) {
+      /* Skip entirely if this (layer, priority) slot has no non-zero
+       * pixels on this line — common enough (empty BG3 etc.) to be
+       * worth the flag check. */
+      if (!ppu->bgLineNonEmpty[L][P ? 1 : 0]) continue;
+      /* BG fast path — 256-wide array of palette indices. */
+      const uint8_t *src = ppu->bgLine[L][P ? 1 : 0];
+      if (!windowed) {
+        for (int x = 0; x < 256; x++) {
+          uint8_t p = src[x];
+          if (p != 0) out[x] = cg[p];
+        }
+      } else {
+        for (int x = 0; x < 256; x++) {
+          uint8_t p = src[x];
+          if (p != 0 && !ppu_getWindowState(ppu, L, x)) out[x] = cg[p];
+        }
+      }
+    } else if (L == 4) {
+      /* Sprite slot: per-priority selection from pre-evaluated buffers. */
+      const uint8_t *sp  = ppu->objPixelBuffer;
+      const uint8_t *spr = ppu->objPriorityBuffer;
+      if (!windowed) {
+        for (int x = 0; x < 256; x++) {
+          if (spr[x] == P && sp[x] != 0) {
+            uint8_t p = sp[x];
+            /* Sprites below palette-color 0xc0 with skipColorMath
+             * set behave like layer 6 in ppu_getPixel; we don't
+             * need to distinguish for final RGB output. */
+            out[x] = cg[p];
+          }
+        }
+      } else {
+        for (int x = 0; x < 256; x++) {
+          if (spr[x] == P && sp[x] != 0 && !ppu_getWindowState(ppu, L, x)) {
+            out[x] = cg[sp[x]];
+          }
+        }
+      }
+    } else {
+      /* BG slow path — mosaic / Mode 7 / hires / OPT. Per-x fallback
+       * using the canonical helpers. Rare for target-game subset. */
+      for (int x = 0; x < 256; x++) {
+        if (windowed && ppu_getWindowState(ppu, L, x)) continue;
+        int lx = x;
+        int ly = y;
+        if (ppu->bgLayer[L].mosaicEnabled && ppu->mosaicSize > 1) {
+          lx -= lx % ppu->mosaicSize;
+          ly -= (ly - ppu->mosaicStartLine) % ppu->mosaicSize;
+        }
+        int pixel;
+        if (ppu->mode == 7) {
+          pixel = ppu_getPixelForMode7(ppu, lx, L, P);
+        } else {
+          lx += ppu->bgLayer[L].hScroll;
+          if (ppu->mode == 5 || ppu->mode == 6) {
+            lx *= 2;
+            lx += (ppu->bgLayer[L].mosaicEnabled) ? 0 : 1;
+            if (ppu->interlace) {
+              ly *= 2;
+              ly += (ppu->evenFrame || ppu->bgLayer[L].mosaicEnabled) ? 0 : 1;
+            }
+          }
+          ly += ppu->bgLayer[L].vScroll;
+          if (ppu->mode == 2 || ppu->mode == 4 || ppu->mode == 6) {
+            ppu_handleOPT(ppu, L, &lx, &ly);
+          }
+          pixel = ppu_getPixelForBgLayer(ppu, lx & 0x3ff, ly & 0x3ff, L, P);
+        }
+        if (pixel != 0) out[x] = cg[pixel];
+      }
+    }
+  }
+
+  /* Brightness: cgramRgb565 already has brightness baked in via
+   * ppu_rebuildCgramCache, so no post-pass needed. */
+}
+
 LAKESNES_HOT void ppu_runLine(Ppu* ppu, int line) {
   // called for lines 1-224/239
   /* ThumbySNES frameskip: bail before sprite eval + BG cache — the
@@ -553,6 +680,17 @@ LAKESNES_HOT void ppu_runLine(Ppu* ppu, int line) {
   }
 
   if(ppu->mode == 7) ppu_calculateMode7Starts(ppu, line);
+
+  /* ThumbySNES per-line RGB565 fast path: one full-line composite
+   * into lineRgb565, delivered to the frontend via scanlineCbRgb565.
+   * Preferred over the BGRX pixelBuffer path for anyone who can
+   * consume RGB565 directly (the 2×2 blend downstream on the device
+   * already works in RGB565 space). */
+  if (ppu->scanlineCbRgb565) {
+    ppu_composeLineRgb565(ppu, line, ppu->lineRgb565);
+    ppu->scanlineCbRgb565(ppu->scanlineUserRgb565, line, ppu->lineRgb565);
+    return;
+  }
 
   /* ThumbySNES native-LCD fast path: if the frontend installed an LCD
    * framebuffer, composite 128 pixels straight into it. Skip the line
@@ -597,6 +735,13 @@ void ppu_setScanlineCallback(Ppu* ppu,
                              void *user) {
   ppu->scanlineCb = cb;
   ppu->scanlineUser = user;
+}
+
+void ppu_setScanlineCbRgb565(Ppu* ppu,
+                             void (*cb)(void*, int, const uint16_t*),
+                             void *user) {
+  ppu->scanlineCbRgb565 = cb;
+  ppu->scanlineUserRgb565 = user;
 }
 
 void ppu_setLcdMode(Ppu* ppu, uint16_t *lcdFb, int lcdFbW, int lcdFbH,
