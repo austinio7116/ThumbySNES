@@ -1,5 +1,12 @@
 # ThumbySNES — current status (2026-04-13)
 
+> **Update later on 2026-04-13**: native-LCD render path + frameskip landed —
+> see "Native-LCD render mode" below. Expected device perf in content
+> jumps from ~4.8 fps to **~10–15 fps** (host bench shows 1.8–2.4× speedup
+> across Zelda ALTTP / FFII / Super Metroid / DKC; device flash-XIP makes
+> PPU a bigger share of total so device gains should be larger). Still
+> short of the 30 fps target without a dual-core split + tile-major PPU.
+
 ## What works
 
 - **SNES emulation runs on stock Thumby Color hardware** (RP2350 M33 @ 300 MHz, 520 KB SRAM, 16 MB flash).
@@ -42,6 +49,9 @@
 | Per-line BG layer pre-render cache | small gain — gcc was already inlining the per-pixel path well |
 | `renderXStart`/`renderXEnd` to skip the 32 cropped edge pixels per line | ~12% fewer per-pixel calls |
 | `--gc-sections`, `-ffunction-sections`, `-fdata-sections` | dead-strip unused code |
+| **Native-LCD render mode** (`snes_set_lcd_mode`, later on 2026-04-13) | PPU composites RGB565 straight into the 128×128 device framebuffer at native resolution — renders only the 128 columns × 128 rows the LCD will display (vs 224×224 + 2×2 downscale). Cuts per-pixel compositor calls ~3×, and BG-line cache / sprite eval / per-line orchestration are skipped entirely for the ~43% of SNES lines whose 7:4 mapping collides with another. Host bench: **1.8–2.4× speedup** across the test ROM set. |
+| **CGRAM → RGB565 table** (brightness baked in, lazy rebuild) | Collapses the per-pixel 3-channel brightness math + byte packing into a single uint16 array read. |
+| **Frameskip** (`snes_set_frameskip`) | Skips per-line sprite eval + BG cache + compositing on alternate frames while CPU + APU advance normally — halves the remaining PPU cost at the price of temporal choppiness. Currently enabled on device with `skip = 1`. |
 
 ### Optimizations tried + reverted
 
@@ -51,6 +61,10 @@
 | `-flto` | code bloat exceeded M33's 16KB icache — slight regression |
 
 ### Why we can't get to 30+ fps without bigger surgery
+
+*(With the native-LCD + frameskip path, we're now ~halfway there —
+device-side perf measurement still needed, but host gains suggest
+~10–15 fps in content. Getting to 30 fps still requires:)*
 
 `ppu_handlePixel` is called 224 × 256 = ~57K times per frame. Each call iterates layer slots (4-5 in mode 1), reads VRAM + palette, writes pixelBuffer. At ~600 cycles/call on M33, that's ~34M cycles/frame just in per-pixel work — 50%+ of total. Even fully eliminating per-pixel work only gets us from ~5 fps to ~10 fps.
 

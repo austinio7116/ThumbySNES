@@ -131,7 +131,7 @@ static void audio_cb(void *user, Uint8 *stream, int len)
  *   FILL — 224x224 crop → 128x128 (new default, fills the screen)
  *   FIT  — 256x224 → 128x112 letterboxed (matches NES blit_blend shape)
  *   FULL — 256x224 raw, 2x upscale (for comparing what blend loses) */
-enum { MODE_FILL = 0, MODE_FIT = 1, MODE_FULL = 2, MODE_COUNT = 3 };
+enum { MODE_FILL = 0, MODE_FIT = 1, MODE_FULL = 2, MODE_LCD = 3, MODE_COUNT = 4 };
 
 typedef struct {
     SDL_Window *win;
@@ -159,6 +159,11 @@ static void display_recreate(display_t *d, int mode)
         d->tex_w = THUMBY_W; d->tex_h = THUMBY_H;
         win_w = THUMBY_W * THUMBY_SCALE; win_h = THUMBY_H * THUMBY_SCALE;
         title = "ThumbySNES — 128x128 FIT (256x224→128x112 + letterbox)  [TAB to cycle]";
+        break;
+    case MODE_LCD:
+        d->tex_w = THUMBY_W; d->tex_h = THUMBY_H;
+        win_w = THUMBY_W * THUMBY_SCALE; win_h = THUMBY_H * THUMBY_SCALE;
+        title = "ThumbySNES — native LCD mode (PPU renders 128x128 directly)  [TAB to cycle]";
         break;
     default: /* MODE_FULL */
         d->tex_w = SNES_W; d->tex_h = SNES_H;
@@ -192,6 +197,7 @@ int main(int argc, char **argv)
         if      (!strcmp(argv[i], "--fill")) start_mode = MODE_FILL;
         else if (!strcmp(argv[i], "--fit"))  start_mode = MODE_FIT;
         else if (!strcmp(argv[i], "--full")) start_mode = MODE_FULL;
+        else if (!strcmp(argv[i], "--lcd"))  start_mode = MODE_LCD;
         /* legacy alias */
         else if (!strcmp(argv[i], "--thumby")) start_mode = MODE_FIT;
         else if (!strcmp(argv[i], "--xip"))    use_xip = 1;
@@ -243,20 +249,35 @@ int main(int argc, char **argv)
             }
         }
         snes_set_pad(keys_to_pad());
+        /* LCD mode: let the PPU render directly into s_fb_thumby, no
+         * full 256x224 intermediate, no downscale pass. Matches the
+         * device-side fast path. */
+        if (d.mode == MODE_LCD) {
+            snes_set_skip_color_math(1);
+            snes_set_lcd_mode(s_fb_thumby, THUMBY_W, THUMBY_H);
+        } else {
+            snes_set_lcd_mode(NULL, 0, 0);
+            snes_set_skip_color_math(0);
+        }
         snes_run_frame();
-        snes_get_framebuffer(s_fb_full);
 
         const uint16_t *src;
         int pitch_bytes;
         if (d.mode == MODE_FILL) {
+            snes_get_framebuffer(s_fb_full);
             downscale_fill(s_fb_full, s_fb_thumby);
             src = s_fb_thumby;
             pitch_bytes = THUMBY_W * sizeof(uint16_t);
         } else if (d.mode == MODE_FIT) {
+            snes_get_framebuffer(s_fb_full);
             downscale_fit(s_fb_full, s_fb_thumby);
             src = s_fb_thumby;
             pitch_bytes = THUMBY_W * sizeof(uint16_t);
+        } else if (d.mode == MODE_LCD) {
+            src = s_fb_thumby;
+            pitch_bytes = THUMBY_W * sizeof(uint16_t);
         } else {
+            snes_get_framebuffer(s_fb_full);
             src = s_fb_full;
             pitch_bytes = SNES_W * sizeof(uint16_t);
         }

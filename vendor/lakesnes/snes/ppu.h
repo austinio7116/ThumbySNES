@@ -172,6 +172,51 @@ struct Ppu {
    * 32 invisible pixels per line (~12.5% fewer ppu_handlePixel calls). */
   int renderXStart;
   int renderXEnd;
+
+  /* ThumbySNES native-LCD render mode.
+   *
+   * When `lcdFb` is non-NULL the PPU bypasses the 256-wide `pixelBuffer`
+   * + BGRX-bytes pipeline entirely and composites RGB565 straight into
+   * the caller's LCD framebuffer at native device resolution. Huge win
+   * on a 128×128 LCD: we collapse 224×224 source pixels (≈50K calls to
+   * ppu_handlePixel per frame) to 128×128 (≈16K) — a 3× cut on the
+   * dominant cost in the profile.
+   *
+   *   lcdFb          = output framebuffer, RGB565, row-major, row 0 at top.
+   *   lcdFbW, lcdFbH = output dimensions (expected 128×128).
+   *   lcdSrcX[ox]    = source SNES x (0..255) sampled for device column ox.
+   *   lcdDevY[sy]    = device row this SNES line (sy=0..223) maps onto,
+   *                    or -1 if that line should be skipped entirely for
+   *                    pixel compositing (its sy maps to a device row
+   *                    that a lower sy already filled).
+   *
+   * Sprite eval + BG line cache still run on every visible SNES line so
+   * OAM range/time-over state stays correct; the only work skipped is
+   * per-pixel compositing for lines that don't survive downsampling.
+   *
+   * When `lcdFb` is NULL the PPU runs its classic full-width path — host
+   * build and unit tests use that. */
+  uint16_t *lcdFb;
+  int       lcdFbW;
+  int       lcdFbH;
+  uint8_t   lcdSrcX[128];
+  int8_t    lcdDevY[239];  /* 224 visible lines (+slack for overscan). */
+
+  /* ThumbySNES CGRAM → RGB565 cache with brightness baked in.
+   *
+   * ppu_handlePixel's classic path re-derives r/g/b/brightness math
+   * from cgram per pixel. In LCD mode we collapse that to a single
+   * uint16_t array read — the table is rebuilt lazily when CGRAM or
+   * brightness changes. `cgramDirty` is set by writes to $2121/$2122
+   * and to $2100 (brightness), and cleared on rebuild. */
+  uint16_t  cgramRgb565[256];
+  uint8_t   cgramDirty;
+
+  /* ThumbySNES frameskip hint — when non-zero, ppu_runLine runs the
+   * sprite eval + BG cache prologue (so range/time-over state stays
+   * accurate) but skips per-pixel compositing entirely. snes_core
+   * toggles this for frameskipped frames. */
+  uint8_t   skipRender;
 };
 
 enum { ppu_pixelOutputFormatXBGR = 0, ppu_pixelOutputFormatBGRX = 1 };
@@ -191,5 +236,12 @@ void ppu_setPixelOutputFormat(Ppu* ppu, int pixelOutputFormat);
 void ppu_setScanlineCallback(Ppu* ppu,
                              void (*cb)(void*, int, const uint8_t*),
                              void *user);
+
+/* ThumbySNES: enable native-LCD rendering. `lcdFb` is a W×H RGB565
+ * framebuffer; the PPU writes composited output directly into it with
+ * no intermediate pixelBuffer or scanline callback. Passing lcdFb=NULL
+ * returns the PPU to its classic full-width path. */
+void ppu_setLcdMode(Ppu* ppu, uint16_t *lcdFb, int lcdFbW, int lcdFbH,
+                    const uint8_t *lcdSrcX, const int8_t *lcdDevY);
 
 #endif

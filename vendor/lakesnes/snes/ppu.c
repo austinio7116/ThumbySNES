@@ -81,6 +81,14 @@ Ppu* ppu_init(Snes* snes) {
   ppu->skipColorMath = false;
   ppu->renderXStart = 0;
   ppu->renderXEnd   = 256;
+  ppu->lcdFb = NULL;
+  ppu->lcdFbW = 0;
+  ppu->lcdFbH = 0;
+  memset(ppu->lcdSrcX, 0, sizeof(ppu->lcdSrcX));
+  memset(ppu->lcdDevY, -1, sizeof(ppu->lcdDevY));
+  memset(ppu->cgramRgb565, 0, sizeof(ppu->cgramRgb565));
+  ppu->cgramDirty = 1;
+  ppu->skipRender = 0;
   for (int L = 0; L < 4; L++) ppu->bgLineCacheValid[L] = 0;
   ppu_setPixelOutputFormat(ppu, ppu_pixelOutputFormatBGRX);
   return ppu;
@@ -186,6 +194,9 @@ void ppu_reset(Ppu* ppu) {
   ppu->ppu1openBus = 0;
   ppu->ppu2openBus = 0;
   memset(ppu->pixelBuffer, 0, sizeof(ppu->pixelBuffer));
+  /* ThumbySNES: cgramRgb565 is always rebuilt on next render, so just
+   * mark dirty — leaves existing lcdFb pointer/tables alone. */
+  ppu->cgramDirty = 1;
 }
 
 void ppu_handleState(Ppu* ppu, StateHandler* sh) {
@@ -363,8 +374,165 @@ LAKESNES_HOT static void ppu_renderBgLine(Ppu* ppu, int layer, int line) {
   }
 }
 
+/* ThumbySNES LCD mode — rebuild CGRAM → RGB565 table (brightness baked
+ * in). Called lazily when `cgramDirty` is set. 256 entries, cheap.
+ * No LAKESNES_HOT: `static` functions with section attributes produce
+ * mismatched section copies on gcc. Gets inlined into ppu_runLine
+ * (which IS in `.time_critical.snes`) so it lands in SRAM anyway. */
+static void ppu_rebuildCgramCache(Ppu* ppu) {
+  int br = ppu->brightness;
+  /* Precompute per-5-bit-channel: (((v<<3)|(v>>2)) * br / 15) — the same
+   * expression ppu_handlePixel uses. 32 entries → one table lookup per
+   * channel per cgram slot. */
+  uint8_t lut[32];
+  for (int v = 0; v < 32; v++) {
+    int e = ((v << 3) | (v >> 2)) * br / 15;  /* 0..255 */
+    if (e > 255) e = 255;
+    lut[v] = (uint8_t)e;
+  }
+  for (int i = 0; i < 256; i++) {
+    uint16_t c = ppu->cgram[i];
+    int r = c & 0x1f;
+    int g = (c >> 5) & 0x1f;
+    int b = (c >> 10) & 0x1f;
+    uint8_t r8 = lut[r], g8 = lut[g], b8 = lut[b];
+    ppu->cgramRgb565[i] =
+      (uint16_t)(((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3));
+  }
+  ppu->cgramDirty = 0;
+}
+
+/* ThumbySNES LCD-mode per-line cache.
+ *
+ * Before rendering the 128 device columns, we walk the layer-slot list
+ * once and precompute:
+ *   - slotSrc[]  — cached BG line pointer per slot (NULL for sprite slot
+ *                   or when slot isn't usable), saves a branch + indirect
+ *                   array lookup in the hot per-pixel loop;
+ *   - slotActive[] — `0` if the layer slot is disabled entirely for
+ *                   this line (skip slot in hot loop);
+ *   - slotWindowed[] — `0` = no window check needed in hot loop,
+ *                   `1` = use `slotWinMask` per-x.
+ *   - slotWinMask[slot][x] — 1 when window masks out pixel x.
+ *
+ * Keeps the per-pixel compose loop to ~1 array read + 1 compare per
+ * slot. Zero function calls.
+ *
+ * `slotWinMask` is allocated on the stack in ppu_runLine so the PPU
+ * struct doesn't grow. 12 × 32 = 384 bytes. */
+typedef struct {
+  const uint8_t *slotSrc[12];    /* BG: bgLine[layer][prio]; else NULL. */
+  int8_t         slotActive[12]; /* 0 = disabled. */
+  int8_t         slotWindowed[12];
+  uint8_t        slotLayer[12];
+  uint8_t        slotPriority[12];
+  int            slotCount;
+  int            actMode;
+} LcdLineCtx;
+
+static void ppu_lcdLineSetup(Ppu* ppu, LcdLineCtx *ctx) {
+  int actMode = ppu->mode == 1 && ppu->bg3priority ? 8 : ppu->mode;
+  if (ppu->mode == 7 && ppu->m7extBg) actMode = 9;
+  ctx->actMode = actMode;
+  int n = layerCountPerMode[actMode];
+  ctx->slotCount = n;
+  for (int i = 0; i < n; i++) {
+    int L = layersPerMode[actMode][i];
+    int P = prioritysPerMode[actMode][i];
+    ctx->slotLayer[i] = (uint8_t)L;
+    ctx->slotPriority[i] = (uint8_t)P;
+    ctx->slotActive[i] = ppu->layer[L].mainScreenEnabled ? 1 : 0;
+    ctx->slotWindowed[i] = ppu->layer[L].mainScreenWindowed ? 1 : 0;
+    if (L < 4 && ppu->bgLineCacheValid[L]) {
+      ctx->slotSrc[i] = ppu->bgLine[L][P ? 1 : 0];
+    } else {
+      ctx->slotSrc[i] = NULL;  /* sprite slot or BG slow path */
+    }
+  }
+}
+
+/* LCD-mode per-pixel compositor using the precomputed per-line ctx.
+ * Inner loop is branch-predictable array reads + one potential
+ * function call only on the BG slow path (rare — bgLineCacheValid
+ * is true for simple-mode layers, which is the dominant case for
+ * mode 1/3 games). */
+static uint16_t ppu_composeLcdPixel(Ppu* ppu, const LcdLineCtx *ctx,
+                                     int x, int y) {
+  int layer = 5;
+  int pixel = 0;
+  int n = ctx->slotCount;
+  for (int i = 0; i < n; i++) {
+    if (!ctx->slotActive[i]) continue;
+    int curLayer = ctx->slotLayer[i];
+    int curPriority = ctx->slotPriority[i];
+    if (ctx->slotWindowed[i] && ppu_getWindowState(ppu, curLayer, x)) continue;
+    const uint8_t *src = ctx->slotSrc[i];
+    if (src) {
+      pixel = src[x];
+    } else if (curLayer < 4) {
+      /* Slow path: mosaic / Mode 7 / hires / OPT. */
+      int lx = x;
+      int ly = y;
+      if (ppu->bgLayer[curLayer].mosaicEnabled && ppu->mosaicSize > 1) {
+        lx -= lx % ppu->mosaicSize;
+        ly -= (ly - ppu->mosaicStartLine) % ppu->mosaicSize;
+      }
+      if (ppu->mode == 7) {
+        pixel = ppu_getPixelForMode7(ppu, lx, curLayer, curPriority);
+      } else {
+        lx += ppu->bgLayer[curLayer].hScroll;
+        if (ppu->mode == 5 || ppu->mode == 6) {
+          lx *= 2;
+          lx += (ppu->bgLayer[curLayer].mosaicEnabled) ? 0 : 1;
+          if (ppu->interlace) {
+            ly *= 2;
+            ly += (ppu->evenFrame || ppu->bgLayer[curLayer].mosaicEnabled) ? 0 : 1;
+          }
+        }
+        ly += ppu->bgLayer[curLayer].vScroll;
+        if (ppu->mode == 2 || ppu->mode == 4 || ppu->mode == 6) {
+          ppu_handleOPT(ppu, curLayer, &lx, &ly);
+        }
+        pixel = ppu_getPixelForBgLayer(
+          ppu, lx & 0x3ff, ly & 0x3ff, curLayer, curPriority);
+      }
+    } else {
+      /* sprites */
+      pixel = (ppu->objPriorityBuffer[x] == curPriority) ? ppu->objPixelBuffer[x] : 0;
+    }
+    if (pixel > 0) { layer = curLayer; break; }
+  }
+  if (ppu->directColor && layer < 4 && bitDepthsPerMode[ctx->actMode][layer] == 8) {
+    int r = ((pixel & 0x7) << 2) | ((pixel & 0x100) >> 7);
+    int g = ((pixel & 0x38) >> 1) | ((pixel & 0x200) >> 8);
+    int b = ((pixel & 0xc0) >> 3) | ((pixel & 0x400) >> 8);
+    int br = ppu->brightness;
+    int r8 = ((r << 3) | (r >> 2)) * br / 15;
+    int g8 = ((g << 3) | (g >> 2)) * br / 15;
+    int b8 = ((b << 3) | (b >> 2)) * br / 15;
+    return (uint16_t)(((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3));
+  }
+  return ppu->cgramRgb565[pixel & 0xff];
+}
+
 LAKESNES_HOT void ppu_runLine(Ppu* ppu, int line) {
   // called for lines 1-224/239
+  /* ThumbySNES frameskip: bail before sprite eval + BG cache — the
+   * classic path needs rangeOver/timeOver accuracy, but most games
+   * only check those during vblank, not per-frame. On frameskipped
+   * frames we trade perfect OAM side-effect bookkeeping for the full
+   * per-line work budget. */
+  if (ppu->skipRender) return;
+  /* ThumbySNES LCD mode: lines that don't map to a device row produce
+   * no output, and BG/sprite state is re-computed per line, so we can
+   * bail before sprite eval + BG cache for the ~43% of SNES lines
+   * that are discarded. Same accuracy trade-off as skipRender. */
+  if (ppu->lcdFb) {
+    int sy = line - 1;
+    if (sy >= 0 && sy < (int)sizeof(ppu->lcdDevY) && ppu->lcdDevY[sy] < 0) {
+      return;
+    }
+  }
   // evaluate sprites
   memset(ppu->objPixelBuffer, 0, sizeof(ppu->objPixelBuffer));
   if(!ppu->forcedBlank) ppu_evaluateSprites(ppu, line - 1);
@@ -385,6 +553,32 @@ LAKESNES_HOT void ppu_runLine(Ppu* ppu, int line) {
   }
 
   if(ppu->mode == 7) ppu_calculateMode7Starts(ppu, line);
+
+  /* ThumbySNES native-LCD fast path: if the frontend installed an LCD
+   * framebuffer, composite 128 pixels straight into it. Skip the line
+   * entirely if no device row samples it (lcdDevY == -1). */
+  if (ppu->lcdFb) {
+    int sy = line - 1;
+    if (sy < 0 || sy >= (int)sizeof(ppu->lcdDevY)) return;
+    int devY = ppu->lcdDevY[sy];
+    if (devY < 0 || devY >= ppu->lcdFbH) return;
+    if (ppu->forcedBlank) {
+      uint16_t *out = ppu->lcdFb + devY * ppu->lcdFbW;
+      for (int ox = 0; ox < ppu->lcdFbW; ox++) out[ox] = 0;
+      return;
+    }
+    if (ppu->cgramDirty) ppu_rebuildCgramCache(ppu);
+    LcdLineCtx ctx;
+    ppu_lcdLineSetup(ppu, &ctx);
+    uint16_t *out = ppu->lcdFb + devY * ppu->lcdFbW;
+    int W = ppu->lcdFbW;
+    const uint8_t *srcX = ppu->lcdSrcX;
+    for (int ox = 0; ox < W; ox++) {
+      out[ox] = ppu_composeLcdPixel(ppu, &ctx, srcX[ox], line);
+    }
+    return;
+  }
+
   int xs = ppu->renderXStart, xe = ppu->renderXEnd;
   for(int x = xs; x < xe; x++) {
     ppu_handlePixel(ppu, x, line);
@@ -403,6 +597,19 @@ void ppu_setScanlineCallback(Ppu* ppu,
                              void *user) {
   ppu->scanlineCb = cb;
   ppu->scanlineUser = user;
+}
+
+void ppu_setLcdMode(Ppu* ppu, uint16_t *lcdFb, int lcdFbW, int lcdFbH,
+                    const uint8_t *lcdSrcX, const int8_t *lcdDevY) {
+  ppu->lcdFb = lcdFb;
+  ppu->lcdFbW = lcdFbW;
+  ppu->lcdFbH = lcdFbH;
+  if (lcdFb && lcdSrcX && lcdDevY) {
+    int w = lcdFbW > (int)sizeof(ppu->lcdSrcX) ? (int)sizeof(ppu->lcdSrcX) : lcdFbW;
+    memcpy(ppu->lcdSrcX, lcdSrcX, (size_t)w);
+    memcpy(ppu->lcdDevY, lcdDevY, sizeof(ppu->lcdDevY));
+  }
+  ppu->cgramDirty = 1;
 }
 
 static void ppu_handlePixel(Ppu* ppu, int x, int y) {
@@ -940,7 +1147,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
   switch(adr) {
     case 0x00: {
       // TODO: oam address reset when written on first line of vblank, (and when forced blank is disabled?)
-      ppu->brightness = val & 0xf;
+      uint8_t newBr = val & 0xf;
+      if (newBr != ppu->brightness) ppu->cgramDirty = 1;
+      ppu->brightness = newBr;
       ppu->forcedBlank = val & 0x80;
       break;
     }
@@ -1112,6 +1321,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
         ppu->cgramBuffer = val;
       } else {
         ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
+        ppu->cgramDirty = 1;
       }
       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
       break;

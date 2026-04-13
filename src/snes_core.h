@@ -66,6 +66,27 @@ void snes_set_skip_color_math(int enable);
  * the full SNES width (0, 256). */
 void snes_set_render_x_range(int x_start, int x_end);
 
+/* Native-LCD fast path. When enabled, the PPU composites RGB565 directly
+ * into the caller's 128×128 framebuffer at device resolution — no BGRX
+ * intermediate, no 224-wide line buffer, and lines that don't map to a
+ * device row are skipped entirely for pixel compositing. Cuts the per-
+ * pixel cost ~3× versus the scanline-callback path.
+ *
+ * Call with `fb = NULL` to restore classic full-width rendering (used by
+ * the SDL host for the "FULL" debug mode).
+ *
+ * The caller is responsible for keeping `fb` live for the lifetime of
+ * the emulator session (or until another snes_set_lcd_mode call). */
+void snes_set_lcd_mode(uint16_t *fb, int w, int h);
+
+/* Render 1 in every (skip+1) frames. CPU + APU still advance normally
+ * on every frame (game state stays correct); the PPU's per-pixel
+ * compositing is suppressed on the other frames. `skip=0` = render
+ * every frame (default); `skip=1` = render every other frame; etc.
+ *
+ * Only valid in LCD mode (snes_set_lcd_mode) — classic path ignores. */
+void snes_set_frameskip(int skip);
+
 /* Install a per-scanline output callback (LakeSnes core hooks this
  * via ppu_setScanlineCallback). `cb(user, line, line_buffer)` fires
  * after each visible scanline; `line_buffer` is 256 px × 8 B in BGRX

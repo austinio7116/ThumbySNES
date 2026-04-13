@@ -36,6 +36,17 @@ static Snes      *s_snes = NULL;
 static int        s_loaded = 0;
 static uint16_t   s_pad1 = 0;
 
+/* Native-LCD mode state. `s_lcd_fb` holds the client's framebuffer so
+ * we can re-install it after a frameskipped frame, and so snes_unload
+ * can clear it cleanly. */
+static uint16_t  *s_lcd_fb = NULL;
+static int        s_lcd_w  = 0;
+static int        s_lcd_h  = 0;
+static uint8_t    s_lcd_src_x[128];
+static int8_t     s_lcd_dev_y[239];
+static int        s_frameskip = 0;      /* 0 = no skip, 1 = skip every other, … */
+static int        s_frame_ctr  = 0;
+
 /* Default scanline sink: assemble into a 256x224 RGB565 frame buffer
  * that the (host) frontend can read out via snes_get_framebuffer. The
  * device installs its own callback (downscale + LCD blit) and never
@@ -114,7 +125,17 @@ snes_result_t snes_load_xip(const uint8_t *rom, size_t rom_len)
 snes_result_t snes_run_frame(void)
 {
     if (!s_loaded) return SNES_ERR_NO_ROM;
+    /* Frameskip only applies when we're in LCD mode — classic path still
+     * relies on the scanline callback firing every frame for the host
+     * framebuffer to stay up to date. */
+    int skip_this = 0;
+    if (s_lcd_fb && s_frameskip > 0) {
+        if ((s_frame_ctr % (s_frameskip + 1)) != 0) skip_this = 1;
+        s_frame_ctr++;
+    }
+    s_snes->ppu->skipRender = (uint8_t)(skip_this ? 1 : 0);
     snes_runFrame(s_snes);
+    s_snes->ppu->skipRender = 0;
     return SNES_OK;
 }
 
@@ -126,6 +147,10 @@ void snes_unload(void)
     }
     s_loaded = 0;
     thumbysnes_cart_xip = 0;
+    s_lcd_fb = NULL;
+    s_lcd_w = s_lcd_h = 0;
+    s_frameskip = 0;
+    s_frame_ctr = 0;
 }
 
 void snes_get_framebuffer(uint16_t *dst)
@@ -194,6 +219,58 @@ void snes_set_render_x_range(int x_start, int x_end)
     s_snes->ppu->renderXEnd   = x_end;
 }
 
+/* Precompute FILL-mode source-x / device-row tables. The device does
+ * 7:4 stride from 224 source pixels (cropped 16 each side) to 128
+ * device pixels; to render at native resolution we pick one source
+ * sample per device pixel instead of averaging pairs. Near-identical
+ * visual result on-device at a fraction of the cost. */
+static void snes_lcd_build_fill_tables(void)
+{
+    /* Horizontal: device col ox ∈ [0, 128). Source x = ox*7/4 + 16,
+     * giving a 128-long list of SNES x's (16..239). */
+    for (int ox = 0; ox < 128; ox++) {
+        int sx = ((ox * 7) >> 2) + 16;
+        if (sx > 239) sx = 239;
+        s_lcd_src_x[ox] = (uint8_t)sx;
+    }
+    /* Vertical: for each SNES line sy ∈ [0, 224), device row dy =
+     * sy*4/7. Multiple sys map to the same dy; we mark only the
+     * first one (-1 for the rest, which skips pixel compositing
+     * on that line). */
+    int prev_dy = -1;
+    for (int sy = 0; sy < 239; sy++) {
+        if (sy < 224) {
+            int dy = (sy * 4) / 7;
+            s_lcd_dev_y[sy] = (dy != prev_dy) ? (int8_t)dy : (int8_t)-1;
+            prev_dy = dy;
+        } else {
+            s_lcd_dev_y[sy] = -1;
+        }
+    }
+}
+
+void snes_set_lcd_mode(uint16_t *fb, int w, int h)
+{
+    s_lcd_fb = fb;
+    s_lcd_w  = w;
+    s_lcd_h  = h;
+    if (!s_snes) return;
+    if (!fb) {
+        ppu_setLcdMode(s_snes->ppu, NULL, 0, 0, NULL, NULL);
+        return;
+    }
+    snes_lcd_build_fill_tables();
+    ppu_setLcdMode(s_snes->ppu, fb, w, h, s_lcd_src_x, s_lcd_dev_y);
+}
+
+void snes_set_frameskip(int skip)
+{
+    if (skip < 0) skip = 0;
+    if (skip > 8) skip = 8;
+    s_frameskip = skip;
+    s_frame_ctr = 0;
+}
+
 #include "cpu.h"
 #include "spc.h"
 #include "apu.h"
@@ -237,6 +314,8 @@ void          snes_set_pad(uint16_t pad_bits)                     { (void)pad_bi
 void          snes_set_scanline_cb(void (*cb)(void*, int, const uint8_t*), void *user) { (void)cb; (void)user; }
 void          snes_set_skip_color_math(int enable){ (void)enable; }
 void          snes_set_render_x_range(int s, int e){ (void)s; (void)e; }
+void          snes_set_lcd_mode(uint16_t *fb, int w, int h){ (void)fb; (void)w; (void)h; }
+void          snes_set_frameskip(int skip){ (void)skip; }
 uint16_t      snes_dbg_pc(void)          { return 0; }
 uint8_t       snes_dbg_pb(void)          { return 0; }
 uint16_t      snes_dbg_a(void)           { return 0; }
