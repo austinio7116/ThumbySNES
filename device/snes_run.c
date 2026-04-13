@@ -91,8 +91,13 @@ static void __attribute__((section(".time_critical.snes_blit")))
 /* Map Thumby physical buttons to the SNES pad bitmask snes_core expects.
  * YX profile (see PLAN.md §7): A→SNES A, B→SNES B, LB→SNES Y, RB→SNES X.
  * MENU is *not* mapped here — it's handled separately by the run-loop:
- * long-press exits, short-press passes through as SNES Start. */
-static uint16_t snes_read_pad(bool send_start) {
+ * long-press exits, short-press passes through as SNES Start.
+ *
+ * LB+RB chord is an alternate Start + exit, for units with a broken
+ * MENU button. While the chord is active Y and X are suppressed so
+ * the pad cleanly shows only Start (no spurious X/Y input to the
+ * game during the chord press). */
+static uint16_t snes_read_pad(bool send_start, bool lr_chord) {
     uint16_t bits = 0;
     if (snes_buttons_is_pressed(SNES_BTN_UP))    bits |= (1u << 11);
     if (snes_buttons_is_pressed(SNES_BTN_DOWN))  bits |= (1u << 10);
@@ -100,8 +105,10 @@ static uint16_t snes_read_pad(bool send_start) {
     if (snes_buttons_is_pressed(SNES_BTN_RIGHT)) bits |= (1u <<  8);
     if (snes_buttons_is_pressed(SNES_BTN_A))     bits |= (1u <<  7);
     if (snes_buttons_is_pressed(SNES_BTN_B))     bits |= (1u << 15);
-    if (snes_buttons_is_pressed(SNES_BTN_LB))    bits |= (1u << 14); /* Y */
-    if (snes_buttons_is_pressed(SNES_BTN_RB))    bits |= (1u <<  6); /* X */
+    if (!lr_chord) {
+        if (snes_buttons_is_pressed(SNES_BTN_LB)) bits |= (1u << 14); /* Y */
+        if (snes_buttons_is_pressed(SNES_BTN_RB)) bits |= (1u <<  6); /* X */
+    }
     if (send_start)                              bits |= (1u << 12); /* Start */
     return bits;
 }
@@ -119,12 +126,16 @@ static void draw_loading(uint16_t *fb, const char *rom_name) {
 
 static void draw_error(uint16_t *fb, const char *msg) {
     memset(fb, 0, FB_W * FB_H * sizeof(uint16_t));
-    snes_font_draw(fb, "error", 45, 44, 0xF800);
-    snes_font_draw(fb, msg,    2, 60, 0xCE59);
-    snes_font_draw(fb, "press MENU to return", 1, 100, 0xCE59);
+    snes_font_draw(fb, "error",        45, 44, 0xF800);
+    snes_font_draw(fb, msg,             2, 60, 0xCE59);
+    snes_font_draw(fb, "MENU or L+R",  24, 96, 0xCE59);
+    snes_font_draw(fb, "to return",    32,108, 0xCE59);
     snes_lcd_present(fb);
-    while (!snes_buttons_just_pressed(SNES_BTN_MENU)) {
+    for (;;) {
         snes_buttons_poll();
+        if (snes_buttons_just_pressed(SNES_BTN_MENU)) break;
+        if (snes_buttons_is_pressed(SNES_BTN_LB) &&
+            snes_buttons_is_pressed(SNES_BTN_RB)) break;
         sleep_ms(16);
     }
 }
@@ -171,10 +182,18 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
      * press is forwarded as SNES Start. We send Start for the whole
      * time MENU is held until the long-press threshold elapses, so
      * games that need Start to be held briefly (most title screens)
-     * see it. */
+     * see it.
+     *
+     * LB+RB chord: alternate Start / exit for units with a broken
+     * MENU button. Same thresholds: while both shoulders are held,
+     * SNES Start is sent continuously (with Y/X suppressed so the
+     * game sees a clean Start press); ≥ 800 ms of chord-hold exits
+     * to the picker. */
     #define MENU_HOLD_EXIT_MS 800
-    absolute_time_t menu_press_t = nil_time;
-    bool menu_was_down = false;
+    absolute_time_t menu_press_t  = nil_time;
+    absolute_time_t chord_press_t = nil_time;
+    bool menu_was_down  = false;
+    bool chord_was_down = false;
 
     int exit_pressed = 0;
     int frame = 0;
@@ -185,22 +204,30 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
     while (!exit_pressed) {
         snes_buttons_poll();
 
-        bool menu_now = snes_buttons_is_pressed(SNES_BTN_MENU);
+        bool menu_now  = snes_buttons_is_pressed(SNES_BTN_MENU);
+        bool chord_now = snes_buttons_is_pressed(SNES_BTN_LB)
+                      && snes_buttons_is_pressed(SNES_BTN_RB);
         bool send_start = false;
+
         if (menu_now) {
             if (!menu_was_down) menu_press_t = get_absolute_time();
             int held_ms = (int)(absolute_time_diff_us(menu_press_t,
                                   get_absolute_time()) / 1000);
-            if (held_ms >= MENU_HOLD_EXIT_MS) {
-                exit_pressed = 1;
-            } else {
-                /* Short press in progress — forward as SNES Start. */
-                send_start = true;
-            }
+            if (held_ms >= MENU_HOLD_EXIT_MS) exit_pressed = 1;
+            else                              send_start  = true;
         }
         menu_was_down = menu_now;
 
-        snes_set_pad(snes_read_pad(send_start));
+        if (chord_now) {
+            if (!chord_was_down) chord_press_t = get_absolute_time();
+            int held_ms = (int)(absolute_time_diff_us(chord_press_t,
+                                  get_absolute_time()) / 1000);
+            if (held_ms >= MENU_HOLD_EXIT_MS) exit_pressed = 1;
+            else                              send_start  = true;
+        }
+        chord_was_down = chord_now;
+
+        snes_set_pad(snes_read_pad(send_start, chord_now));
         s_blend_a_dev_y = -1;
         snes_run_frame();
         if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
