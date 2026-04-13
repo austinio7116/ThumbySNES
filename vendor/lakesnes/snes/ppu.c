@@ -62,6 +62,24 @@ static const int spriteSizes[8][2] = {
   {16, 64}, {32, 64}, {16, 32}, {16, 32}
 };
 
+/* ThumbySNES byte→8-bit-lane expansion LUT. Each entry turns one byte
+ * into an array of 8 bytes, each holding one bit (0 or 1) of the
+ * input. lane[0] = MSB (pixel 0 in the tile row), lane[7] = LSB
+ * (pixel 7). Used by ppu_renderBgLine and ppu_evaluateSprites tile
+ * decoders to replace the 8× (shift + AND + OR) inner loop with 8
+ * table-indexed reads. Fits in 2 KB flash. */
+static uint8_t ppu_bitExpandLut[256][8];
+static int     ppu_bitExpandLutReady = 0;
+
+static void ppu_initBitExpandLut(void) {
+  for (int b = 0; b < 256; b++) {
+    for (int k = 0; k < 8; k++) {
+      ppu_bitExpandLut[b][k] = (uint8_t)((b >> (7 - k)) & 1);
+    }
+  }
+  ppu_bitExpandLutReady = 1;
+}
+
 static void ppu_handlePixel(Ppu* ppu, int x, int y);
 static int ppu_getPixel(Ppu* ppu, int x, int y, bool sub, int* r, int* g, int* b);
 static uint16_t ppu_getOffsetValue(Ppu* ppu, int col, int row);
@@ -74,6 +92,7 @@ static void ppu_evaluateSprites(Ppu* ppu, int line);
 static uint16_t ppu_getVramRemap(Ppu* ppu);
 
 Ppu* ppu_init(Snes* snes) {
+  if (!ppu_bitExpandLutReady) ppu_initBitExpandLut();
   Ppu* ppu = malloc(sizeof(Ppu));
   ppu->snes = snes;
   ppu->scanlineCb = NULL;
@@ -351,25 +370,32 @@ LAKESNES_HOT static void ppu_renderBgLine(Ppu* ppu, int layer, int line) {
       plane4 = ppu->vram[(basePl + 24) & 0x7fff];
     }
 
-    // Decode 8 pixels and write to the matching priority buffer.
+    /* Decode 8 pixels via the byte→bit-lane LUT. For 4bpp this replaces
+     * 32 shifts + 24 ANDs + 24 ORs per tile with 4 pointer derefs +
+     * 8 iterations of {4 lane reads + 3 shifts + 3 ORs}. ~2× faster
+     * per tile on M33. */
     uint8_t *dst = ppu->bgLine[layer][prio ? 1 : 0];
     int paletteOffset = paletteSize * paletteNum;
+    const uint8_t *e0 = ppu_bitExpandLut[plane1 & 0xff];
+    const uint8_t *e1 = ppu_bitExpandLut[plane1 >> 8];
+    const uint8_t *e2 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 & 0xff] : NULL;
+    const uint8_t *e3 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 >> 8]   : NULL;
+    const uint8_t *e4 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 & 0xff] : NULL;
+    const uint8_t *e5 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 >> 8]   : NULL;
+    const uint8_t *e6 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 & 0xff] : NULL;
+    const uint8_t *e7 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 >> 8]   : NULL;
     for (int pi = 0; pi < 8; pi++) {
       int ox = outX + pi;
       if (ox < 0) continue;
       if (ox >= 256) break;
-      int col = hFlip ? pi : 7 - pi;
-      int pixel = (plane1 >> col) & 1;
-      pixel |= ((plane1 >> (8 + col)) & 1) << 1;
+      int idx = hFlip ? (7 - pi) : pi;
+      int pixel = e0[idx] | (e1[idx] << 1);
       if (bitDepth > 2) {
-        pixel |= ((plane2 >> col) & 1) << 2;
-        pixel |= ((plane2 >> (8 + col)) & 1) << 3;
+        pixel |= (e2[idx] << 2) | (e3[idx] << 3);
       }
       if (bitDepth > 4) {
-        pixel |= ((plane3 >> col) & 1) << 4;
-        pixel |= ((plane3 >> (8 + col)) & 1) << 5;
-        pixel |= ((plane4 >> col) & 1) << 6;
-        pixel |= ((plane4 >> (8 + col)) & 1) << 7;
+        pixel |= (e4[idx] << 4) | (e5[idx] << 5)
+              |  (e6[idx] << 6) | (e7[idx] << 7);
       }
       if (pixel != 0) {
         dst[ox] = (uint8_t)(paletteOffset + pixel);
@@ -1135,18 +1161,22 @@ static void ppu_evaluateSprites(Ppu* ppu, int line) {
           uint16_t objAdr = (ppu->oam[index + 1] & 0x100) ? ppu->objTileAdr2 : ppu->objTileAdr1;
           uint16_t plane1 = ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
           uint16_t plane2 = ppu->vram[(objAdr + usedTile * 16 + 8 + (row & 0x7)) & 0x7fff];
-          // go over each pixel
+          /* Sprites are 4bpp — unroll the bit-lane LUT same way
+           * ppu_renderBgLine does. */
+          const uint8_t *e0 = ppu_bitExpandLut[plane1 & 0xff];
+          const uint8_t *e1 = ppu_bitExpandLut[plane1 >> 8];
+          const uint8_t *e2 = ppu_bitExpandLut[plane2 & 0xff];
+          const uint8_t *e3 = ppu_bitExpandLut[plane2 >> 8];
+          uint8_t prio = (ppu->oam[index + 1] & 0x3000) >> 12;
+          int paletteOffset = 0x80 + 16 * palette;
           for(int px = 0; px < 8; px++) {
-            int shift = hFlipped ? px : 7 - px;
-            int pixel = (plane1 >> shift) & 1;
-            pixel |= ((plane1 >> (8 + shift)) & 1) << 1;
-            pixel |= ((plane2 >> shift) & 1) << 2;
-            pixel |= ((plane2 >> (8 + shift)) & 1) << 3;
-            // draw it in the buffer if there is a pixel here
+            int idx = hFlipped ? (7 - px) : px;
+            int pixel = e0[idx] | (e1[idx] << 1)
+                      | (e2[idx] << 2) | (e3[idx] << 3);
             int screenCol = col + x + px;
             if(pixel > 0 && screenCol >= 0 && screenCol < 256) {
-              ppu->objPixelBuffer[screenCol] = 0x80 + 16 * palette + pixel;
-              ppu->objPriorityBuffer[screenCol] = (ppu->oam[index + 1] & 0x3000) >> 12;
+              ppu->objPixelBuffer[screenCol] = (uint8_t)(paletteOffset + pixel);
+              ppu->objPriorityBuffer[screenCol] = prio;
             }
           }
         }

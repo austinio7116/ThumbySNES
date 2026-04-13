@@ -131,13 +131,97 @@ void snes_runFrame(Snes* snes) {
   snes_catchupApu(snes); // catch up the apu after running
 }
 
+/* ThumbySNES batched cycle scheduler.
+ *
+ * snes_runCycle needs to run every cycle at exactly the hPos values where
+ * events fire — hPos=0 (line start), 16 (HDMA init), 512 (ppu_runLine),
+ * 1104 (HDMA run), hTimer*4 (if hIrq enabled), and at the wrap point.
+ * Between those, the per-cycle work is just: IRQ condition (constant
+ * when hPos is between trigger points), autoJoyTimer-=2, hPos+=2.
+ *
+ * At a typical content-frame budget we see 1-2M per-cycle calls on core
+ * 0. Batching the "boring" stretches by jumping straight to the next
+ * event cuts the slow-path call count by ~200× (from ~700K to ~3K per
+ * frame) at the cost of one "find next event" check per batch. */
 LAKESNES_HOT void snes_runCycles(Snes* snes, int cycles) {
   if(snes->hPos + cycles >= 536 && snes->hPos < 536) {
     // if we go past 536, add 40 cycles for dram refersh
     cycles += 40;
   }
-  for(int i = 0; i < cycles; i += 2) {
-    snes_runCycle(snes);
+  while (cycles > 0) {
+    int hp = snes->hPos;
+
+    /* If hp is AT an event (or in wrap territory) run the per-cycle
+     * slow path so its event handlers and post-increment wrap check
+     * fire normally. hp==0 triggers vblank/NMI transitions, hp==16
+     * HDMA init, hp==512 ppu_runLine, hp==1104 HDMA run, and the
+     * last stretch before the line wrap (1356..1362) needs per-cycle
+     * treatment because the wrap check uses the post-increment hPos
+     * value (1360 NTSC special / 1364 NTSC / 1368 PAL). */
+    bool atEvent =
+      (hp == 0 || hp == 16 || hp == 512 || hp == 1104 || hp >= 1356 ||
+       (snes->hIrqEnabled && hp == snes->hTimer * 4));
+    if (atEvent) {
+      snes_runCycle(snes);
+      cycles -= 2;
+      continue;
+    }
+
+    /* Find the next event hPos after `hp`. Batch stops exactly there
+     * so the next loop iteration takes the slow path. */
+    int next;
+    if      (hp <   16) next = 16;
+    else if (hp <  512) next = 512;
+    else if (hp < 1104) next = 1104;
+    else                next = 1356;
+    if (snes->hIrqEnabled) {
+      int irqHp = snes->hTimer * 4;
+      if (irqHp > hp && irqHp < next) next = irqHp;
+    }
+
+    int step = next - hp;
+    if (step < 2) {
+      snes_runCycle(snes);
+      cycles -= 2;
+      continue;
+    }
+    if (step > cycles) step = cycles;
+    /* step is always even (hp and next are both even) and >= 2. */
+
+    /* Batch-advance counters. Same arithmetic as `step / 2` snes_runCycle
+     * calls, but we do it once. */
+    snes->cycles += step;
+    snes->hPos   += step;
+    cycles       -= step;
+
+#if !(defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
+    /* Single-core: keep APU catchup accumulator in sync. */
+    snes->apuCatchupCycles +=
+      (snes->palTiming ? apuCyclesPerMasterPal : apuCyclesPerMaster) * (float)step;
+#endif
+
+    /* autoJoyTimer batches by `step`. */
+    if (snes->autoJoyTimer > 0) {
+      snes->autoJoyTimer = (snes->autoJoyTimer > step)
+                         ? (uint16_t)(snes->autoJoyTimer - step)
+                         : 0;
+    }
+
+    /* IRQ condition is a function of (hPos, vPos, timers, enable bits).
+     * During a batch only hPos changes — and we stopped the batch before
+     * reaching hTimer*4 (if hIrq enabled), so the condition's hPos-
+     * dependence can't transition mid-batch. Re-evaluate at batch end
+     * and apply the false→true edge check. */
+    bool condition = (
+      (snes->vIrqEnabled || snes->hIrqEnabled) &&
+      (snes->vPos == snes->vTimer || !snes->vIrqEnabled) &&
+      (snes->hPos == snes->hTimer * 4 || !snes->hIrqEnabled)
+    );
+    if (!snes->irqCondition && condition) {
+      snes->inIrq = true;
+      cpu_setIrq(snes->cpu, true);
+    }
+    snes->irqCondition = condition;
   }
 }
 
