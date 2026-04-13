@@ -1,11 +1,12 @@
 # ThumbySNES — current status (2026-04-13)
 
-> **Update later on 2026-04-13**: native-LCD render path + frameskip landed —
-> see "Native-LCD render mode" below. Expected device perf in content
-> jumps from ~4.8 fps to **~10–15 fps** (host bench shows 1.8–2.4× speedup
-> across Zelda ALTTP / FFII / Super Metroid / DKC; device flash-XIP makes
-> PPU a bigger share of total so device gains should be larger). Still
-> short of the 30 fps target without a dual-core split + tile-major PPU.
+> **Update later on 2026-04-13**: per-line RGB565 composite + dual-core
+> APU + BG empty-slot skip landed. **Measured on device**:
+> Zelda ALTTP title ≈ **8 fps** (from ~4.8), FF II ≈ **9.6 fps** (from
+> ~5). 2×2 blend preserved — no visual compromise vs the pre-session
+> baseline. Still short of the 30 fps target; the remaining big levers
+> are a tile-major PPU rewrite and/or ARM asm for the master-cycle
+> scheduler (see "Why we can't get to 30+ fps").
 
 ## What works
 
@@ -49,9 +50,12 @@
 | Per-line BG layer pre-render cache | small gain — gcc was already inlining the per-pixel path well |
 | `renderXStart`/`renderXEnd` to skip the 32 cropped edge pixels per line | ~12% fewer per-pixel calls |
 | `--gc-sections`, `-ffunction-sections`, `-fdata-sections` | dead-strip unused code |
-| **Native-LCD render mode** (`snes_set_lcd_mode`, later on 2026-04-13) | PPU composites RGB565 straight into the 128×128 device framebuffer at native resolution — renders only the 128 columns × 128 rows the LCD will display (vs 224×224 + 2×2 downscale). Cuts per-pixel compositor calls ~3×, and BG-line cache / sprite eval / per-line orchestration are skipped entirely for the ~43% of SNES lines whose 7:4 mapping collides with another. Host bench: **1.8–2.4× speedup** across the test ROM set. |
-| **CGRAM → RGB565 table** (brightness baked in, lazy rebuild) | Collapses the per-pixel 3-channel brightness math + byte packing into a single uint16 array read. |
-| **Frameskip** (`snes_set_frameskip`) | Skips per-line sprite eval + BG cache + compositing on alternate frames while CPU + APU advance normally — halves the remaining PPU cost at the price of temporal choppiness. Currently enabled on device with `skip = 1`. |
+| **Native-LCD render mode** (`snes_set_lcd_mode`, available but unused on device) | PPU composites RGB565 straight into the 128×128 device framebuffer at native resolution. Nearest-neighbour 7:4 — text unreadable on content screens, so the classic blend path stays default. Opt-in for specific ROMs. |
+| **CGRAM → RGB565 table** (brightness baked in, lazy rebuild on $2100/$2122) | Collapses the per-pixel 3-channel brightness math + byte packing into a single uint16 array read. |
+| **Per-line RGB565 composite** (`ppu_composeLineRgb565`, `snes_set_scanline_cb_rgb565`) | Replaces per-pixel `ppu_handlePixel` walk with per-line tight-array passes, one per layer slot, bottom-up. 256-pixel RGB565 out directly — device scanline callback gets native RGB565 so the 2×2 blend has no conversion inside. Host bench: **+50-78%**; device Zelda 4.8→8 fps, FFII ≈5→9.6 fps. |
+| **Dual-core APU** (`THUMBYSNES_DUAL_CORE`) | SPC700 + DSP run on core 1; core 0 runs CPU + PPU + LCD. `snes_catchupApu` compiles to a no-op and the per-master-cycle `apuCatchupCycles` float accumulator update is skipped — saves one FPU multiply + add per ~1-2M `snes_runCycle` calls per frame. inPorts/outPorts are byte-atomic; no mailbox needed. Side benefit: SMW's SPC handshake hang may resolve (SPC no longer starved of cycles during CPU polls). |
+| **BG line-cache empty-slot skip** (`bgLineNonEmpty[L][P]`) | `ppu_renderBgLine` flags whether it wrote any non-zero pixel; the compositor skips slots with the flag clear (common — e.g. BG3 on outdoor scenes, BG2 on HUD-only screens). One check replaces a 256-wide pass. |
+| **Frameskip** (`snes_set_frameskip`, available but off) | Opt-in: alternate frames skip PPU. Halves visible fps for a game-speed bump — net-negative at current base rates. |
 
 ### Optimizations tried + reverted
 
@@ -62,9 +66,8 @@
 
 ### Why we can't get to 30+ fps without bigger surgery
 
-*(With the native-LCD + frameskip path, we're now ~halfway there —
-device-side perf measurement still needed, but host gains suggest
-~10–15 fps in content. Getting to 30 fps still requires:)*
+*(After the 2026-04-13-later pass we're measured at 8–10 fps in
+content. Getting to 30 fps still requires at least one of:)*
 
 `ppu_handlePixel` is called 224 × 256 = ~57K times per frame. Each call iterates layer slots (4-5 in mode 1), reads VRAM + palette, writes pixelBuffer. At ~600 cycles/call on M33, that's ~34M cycles/frame just in per-pixel work — 50%+ of total. Even fully eliminating per-pixel work only gets us from ~5 fps to ~10 fps.
 
