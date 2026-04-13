@@ -42,8 +42,9 @@ if(EXISTS ${S9X_SRC}/cpu.c)
         ${S9X_SRC}/apuaux.c
         ${S9X_SRC}/c4.c
         ${S9X_SRC}/c4emu.c
-        ${S9X_SRC}/cheats.c
-        ${S9X_SRC}/cheats2.c
+        # cheats.c / cheats2.c removed — 302 KB static `Cheat` array.
+        # Stubs for S9xInitCheatData / S9xApplyCheats live in snes_core.c
+        # (referenced from memmap.c, gfx.c, gfx16.c).
         ${S9X_SRC}/clip.c
         ${S9X_SRC}/data.c
         ${S9X_SRC}/dsp1.c
@@ -55,8 +56,11 @@ if(EXISTS ${S9X_SRC}/cpu.c)
         ${S9X_SRC}/cpu.c
         ${S9X_SRC}/cpuexec.c
         ${S9X_SRC}/cpuops.c
-        ${S9X_SRC}/sa1.c
-        ${S9X_SRC}/sa1cpu.c
+        # sa1.c / sa1cpu.c removed — Super FX / SA-1 chips out of scope.
+        # Stub for S9xSA1MainLoop lives in snes_core.c; SA-1 struct stays
+        # in globals.c (memmap.c still reads SA1_Map during mapper setup)
+        # but SA1.Executing stays FALSE so the loop is never entered.
+        # Saves ~80 KB text (flash) — SRAM impact is minor.
         ${S9X_SRC}/sdd1.c
         ${S9X_SRC}/sdd1emu.c
         ${S9X_SRC}/snapshot.c
@@ -90,6 +94,11 @@ if(EXISTS ${S9X_SRC}/cpu.c)
         -fomit-frame-pointer
         -ffast-math
         -fstrict-aliasing
+        # Per-function / per-data sections so the linker can dead-strip
+        # unused globals (e.g. the 302 KB `Cheat` struct in globals.c
+        # once cheats.c/cheats2.c are out of the build).
+        -ffunction-sections
+        -fdata-sections
     )
     set(SNES9X2002_PRESENT TRUE)
 else()
@@ -113,6 +122,24 @@ endif()
 # ----------------------------------------------------------------------
 add_executable(snesbench src/snes_bench_main.c)
 target_link_libraries(snesbench PRIVATE thumbysnes)
+target_link_options(snesbench PRIVATE -Wl,--gc-sections)
+
+# ----------------------------------------------------------------------
+# Phase 2 memory audit — wraps malloc/calloc/realloc/free at link time
+# to track live heap + peak watermark across load + N frames per ROM.
+# Only the audit target gets the wrap; snesbench/sneshost stay clean.
+# ----------------------------------------------------------------------
+if(SNES9X2002_PRESENT)
+    add_executable(memaudit src/snes_memaudit_main.c)
+    target_link_libraries(memaudit PRIVATE thumbysnes)
+    target_link_options(memaudit PRIVATE
+        -Wl,--wrap=malloc
+        -Wl,--wrap=calloc
+        -Wl,--wrap=realloc
+        -Wl,--wrap=free
+        -Wl,--gc-sections
+    )
+endif()
 
 # ----------------------------------------------------------------------
 # Phase 1 SDL2 host runner (built only if SDL2 is available)
@@ -121,6 +148,7 @@ find_package(SDL2 QUIET)
 if(SDL2_FOUND)
     add_executable(sneshost src/snes_host_main.c)
     target_link_libraries(sneshost PRIVATE thumbysnes SDL2::SDL2)
+    target_link_options(sneshost PRIVATE -Wl,--gc-sections)
     message(STATUS "ThumbySNES: SDL2 found, building sneshost")
 else()
     find_path(SDL2_INCLUDE_DIR SDL.h PATH_SUFFIXES SDL2)
@@ -129,6 +157,7 @@ else()
         add_executable(sneshost src/snes_host_main.c)
         target_include_directories(sneshost PRIVATE ${SDL2_INCLUDE_DIR})
         target_link_libraries(sneshost PRIVATE thumbysnes ${SDL2_LIBRARY})
+        target_link_options(sneshost PRIVATE -Wl,--gc-sections)
         message(STATUS "ThumbySNES: SDL2 (manual) found, building sneshost")
     else()
         message(STATUS "ThumbySNES: SDL2 not found, skipping sneshost")

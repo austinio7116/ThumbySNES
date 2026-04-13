@@ -263,6 +263,22 @@ void     S9xMessage(int type, int number, const char *message)
     if (message) fprintf(stderr, "snes9x: %s\n", message);
 }
 
+/* Cheats are compiled out to reclaim the 302 KB `Cheat` static array
+ * (see tools/memaudit.md). Callers: memmap.c, gfx.c, gfx16.c. */
+void S9xInitCheatData(void) {}
+void S9xApplyCheats(void) {}
+
+/* SA-1 co-processor support is compiled out — Super Mario RPG / Kirby
+ * Super Star / Marvelous are listed as non-goals in PLAN.md §9. The
+ * SA1.Executing flag stays FALSE (never initialized TRUE), so cpuexec.c's
+ * guarded call site is dormant. Saves ~80 KB of text. Stubs for all
+ * entry points the rest of the core calls into sa1.c for. */
+void    S9xSA1MainLoop(void) {}
+void    S9xSA1Init(void) {}
+void    S9xSA1ExecuteDuringSleep(void) {}
+uint8   S9xGetSA1(uint32 address) { (void)address; return 0; }
+void    S9xSetSA1(uint8 byte, uint32 address) { (void)byte; (void)address; }
+
 #else /* !THUMBYSNES_HAVE_CORE */
 
 snes_result_t snes_load(const uint8_t *rom, size_t rom_len)       { (void)rom; (void)rom_len; return SNES_ERR_NOT_IMPLEMENTED; }

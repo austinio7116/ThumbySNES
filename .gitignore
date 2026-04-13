@@ -12,9 +12,6 @@ build_asan/
 *.map
 .cache/
 compile_commands.json
-# vendored at Phase 0, not yet committed
-vendor/snes9x2002/
-
 # ROM collection — never commit copyrighted game images
 roms/
 *.smc
