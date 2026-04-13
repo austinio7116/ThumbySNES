@@ -25,23 +25,23 @@
 #define BTN_B_GP     25
 #define BTN_MENU_GP  26
 
-static const uint8_t s_pins[SNES_BTN_COUNT] = {
-    [SNES_BTN_LEFT]  = BTN_LEFT_GP,
-    [SNES_BTN_RIGHT] = BTN_RIGHT_GP,
-    [SNES_BTN_UP]    = BTN_UP_GP,
-    [SNES_BTN_DOWN]  = BTN_DOWN_GP,
-    [SNES_BTN_A]     = BTN_A_GP,
-    [SNES_BTN_B]     = BTN_B_GP,
-    [SNES_BTN_LB]    = BTN_LB_GP,
-    [SNES_BTN_RB]    = BTN_RB_GP,
-    [SNES_BTN_MENU]  = BTN_MENU_GP,
+static const uint8_t s_pins[TBY_BTN_COUNT] = {
+    [TBY_BTN_LEFT]  = BTN_LEFT_GP,
+    [TBY_BTN_RIGHT] = BTN_RIGHT_GP,
+    [TBY_BTN_UP]    = BTN_UP_GP,
+    [TBY_BTN_DOWN]  = BTN_DOWN_GP,
+    [TBY_BTN_A]     = BTN_A_GP,
+    [TBY_BTN_B]     = BTN_B_GP,
+    [TBY_BTN_LB]    = BTN_LB_GP,
+    [TBY_BTN_RB]    = BTN_RB_GP,
+    [TBY_BTN_MENU]  = BTN_MENU_GP,
 };
 
 static uint16_t s_cur = 0;
 static uint16_t s_prev = 0;
 
 void snes_buttons_init(void) {
-    for (int i = 0; i < SNES_BTN_COUNT; i++) {
+    for (int i = 0; i < TBY_BTN_COUNT; i++) {
         gpio_init(s_pins[i]);
         gpio_set_dir(s_pins[i], GPIO_IN);
         gpio_pull_up(s_pins[i]);
@@ -52,18 +52,18 @@ void snes_buttons_init(void) {
 void snes_buttons_poll(void) {
     s_prev = s_cur;
     uint16_t b = 0;
-    for (int i = 0; i < SNES_BTN_COUNT; i++) {
+    for (int i = 0; i < TBY_BTN_COUNT; i++) {
         if (!gpio_get(s_pins[i])) b |= (uint16_t)(1u << i);
     }
     s_cur = b;
 }
 
 int snes_buttons_is_pressed(int btn) {
-    return (btn >= 0 && btn < SNES_BTN_COUNT) && (s_cur  & (1u << btn));
+    return (btn >= 0 && btn < TBY_BTN_COUNT) && (s_cur  & (1u << btn));
 }
 
 int snes_buttons_just_pressed(int btn) {
-    return (btn >= 0 && btn < SNES_BTN_COUNT)
+    return (btn >= 0 && btn < TBY_BTN_COUNT)
         && (s_cur & (1u << btn))
         && !(s_prev & (1u << btn));
 }

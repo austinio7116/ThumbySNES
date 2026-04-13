@@ -297,16 +297,16 @@ int snes_picker_run(uint16_t *fb, snes_rom_entry *entries, int *n_entries) {
 
         if (n == 0) { draw_splash(fb); snes_lcd_present(fb); continue; }
 
-        if (snes_buttons_just_pressed(SNES_BTN_DOWN))  cursor = (cursor + 1) % n;
-        if (snes_buttons_just_pressed(SNES_BTN_UP))    cursor = (cursor + n - 1) % n;
-        if (snes_buttons_just_pressed(SNES_BTN_RIGHT)) cursor = (cursor + ROW_COUNT < n) ? cursor + ROW_COUNT : n - 1;
-        if (snes_buttons_just_pressed(SNES_BTN_LEFT))  cursor = (cursor - ROW_COUNT > 0)  ? cursor - ROW_COUNT : 0;
-        if (snes_buttons_just_pressed(SNES_BTN_RB)) {
+        if (snes_buttons_just_pressed(TBY_BTN_DOWN))  cursor = (cursor + 1) % n;
+        if (snes_buttons_just_pressed(TBY_BTN_UP))    cursor = (cursor + n - 1) % n;
+        if (snes_buttons_just_pressed(TBY_BTN_RIGHT)) cursor = (cursor + ROW_COUNT < n) ? cursor + ROW_COUNT : n - 1;
+        if (snes_buttons_just_pressed(TBY_BTN_LEFT))  cursor = (cursor - ROW_COUNT > 0)  ? cursor - ROW_COUNT : 0;
+        if (snes_buttons_just_pressed(TBY_BTN_RB)) {
             favs_toggle(entries[cursor].name);
             favs_save();
             qsort(entries, n, sizeof(snes_rom_entry), cmp_entry);
         }
-        if (snes_buttons_just_pressed(SNES_BTN_A)) {
+        if (snes_buttons_just_pressed(TBY_BTN_A)) {
             favs_save();
             return cursor;
         }

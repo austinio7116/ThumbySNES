@@ -99,15 +99,15 @@ static void __attribute__((section(".time_critical.snes_blit")))
  * game during the chord press). */
 static uint16_t snes_read_pad(bool send_start, bool lr_chord) {
     uint16_t bits = 0;
-    if (snes_buttons_is_pressed(SNES_BTN_UP))    bits |= (1u << 11);
-    if (snes_buttons_is_pressed(SNES_BTN_DOWN))  bits |= (1u << 10);
-    if (snes_buttons_is_pressed(SNES_BTN_LEFT))  bits |= (1u <<  9);
-    if (snes_buttons_is_pressed(SNES_BTN_RIGHT)) bits |= (1u <<  8);
-    if (snes_buttons_is_pressed(SNES_BTN_A))     bits |= (1u <<  7);
-    if (snes_buttons_is_pressed(SNES_BTN_B))     bits |= (1u << 15);
+    if (snes_buttons_is_pressed(TBY_BTN_UP))    bits |= (1u << 11);
+    if (snes_buttons_is_pressed(TBY_BTN_DOWN))  bits |= (1u << 10);
+    if (snes_buttons_is_pressed(TBY_BTN_LEFT))  bits |= (1u <<  9);
+    if (snes_buttons_is_pressed(TBY_BTN_RIGHT)) bits |= (1u <<  8);
+    if (snes_buttons_is_pressed(TBY_BTN_A))     bits |= (1u <<  7);
+    if (snes_buttons_is_pressed(TBY_BTN_B))     bits |= (1u << 15);
     if (!lr_chord) {
-        if (snes_buttons_is_pressed(SNES_BTN_LB)) bits |= (1u << 14); /* Y */
-        if (snes_buttons_is_pressed(SNES_BTN_RB)) bits |= (1u <<  6); /* X */
+        if (snes_buttons_is_pressed(TBY_BTN_LB)) bits |= (1u << 14); /* Y */
+        if (snes_buttons_is_pressed(TBY_BTN_RB)) bits |= (1u <<  6); /* X */
     }
     if (send_start)                              bits |= (1u << 12); /* Start */
     return bits;
@@ -133,9 +133,9 @@ static void draw_error(uint16_t *fb, const char *msg) {
     snes_lcd_present(fb);
     for (;;) {
         snes_buttons_poll();
-        if (snes_buttons_just_pressed(SNES_BTN_MENU)) break;
-        if (snes_buttons_is_pressed(SNES_BTN_LB) &&
-            snes_buttons_is_pressed(SNES_BTN_RB)) break;
+        if (snes_buttons_just_pressed(TBY_BTN_MENU)) break;
+        if (snes_buttons_is_pressed(TBY_BTN_LB) &&
+            snes_buttons_is_pressed(TBY_BTN_RB)) break;
         sleep_ms(16);
     }
 }
@@ -204,9 +204,9 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
     while (!exit_pressed) {
         snes_buttons_poll();
 
-        bool menu_now  = snes_buttons_is_pressed(SNES_BTN_MENU);
-        bool chord_now = snes_buttons_is_pressed(SNES_BTN_LB)
-                      && snes_buttons_is_pressed(SNES_BTN_RB);
+        bool menu_now  = snes_buttons_is_pressed(TBY_BTN_MENU);
+        bool chord_now = snes_buttons_is_pressed(TBY_BTN_LB)
+                      && snes_buttons_is_pressed(TBY_BTN_RB);
         bool send_start = false;
 
         if (menu_now) {
@@ -280,7 +280,7 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
     absolute_time_t deadline = make_timeout_time_ms(3000);
     while (!time_reached(deadline)) {
         snes_buttons_poll();
-        if (snes_buttons_just_pressed(SNES_BTN_MENU)) break;
+        if (snes_buttons_just_pressed(TBY_BTN_MENU)) break;
         sleep_ms(16);
     }
     return 0;
