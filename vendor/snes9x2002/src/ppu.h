@@ -52,17 +52,35 @@ extern uint16 SignExtend [2];
 #define TILE_4BIT 1
 #define TILE_8BIT 2
 
-/* ThumbySNES note: these values are upstream's correct MAXIMA — tile
- * indices are computed `(TileAddr & 0xffff) >> TileShift` with no bounds
- * check, so `MAX_*BIT_TILES` MUST equal `65536 / bytes-per-tile`.
- *   2bpp = 16 B/tile → 4096
- *   4bpp = 32 B/tile → 2048
- *   8bpp = 64 B/tile → 1024
- * Shrinking requires adding an eviction path in tile.c (Phase 4+ work).
- * First attempted 512/512/256 — heap corruption. Reverted. */
+/* ThumbySNES: tile cache slot counts.
+ *
+ * Upstream uses direct indexing `BG.Buffer[TileNumber]` where TileNumber
+ * can be up to (64 KB VRAM / bytes-per-tile) - 1: 4095/2047/1023 for
+ * 2/4/8 bpp. That forces ~896 KB of heap for the three `BG.Buffer`
+ * arrays plus another ~7 KB of validity bitmaps — the single biggest
+ * obstacle to fitting on Thumby Color's 390 KB SRAM budget.
+ *
+ * With THUMBYSNES_TILE_EVICTION (below) the tile cache becomes a
+ * direct-mapped hash: `slot = TileNumber & (MAX_*BIT_TILES - 1)` with
+ * a per-slot `TileTag[]` (full TileNumber) so collisions re-decode on
+ * demand. Shrinks to the slot counts below. MAX_*BIT_TILES MUST be a
+ * power of two.
+ *
+ * Slot counts were picked to cover the working set of most SNES games
+ * (150-300 unique tiles per frame) with some headroom for collisions.
+ * See tools/memaudit.md.
+ */
+#define THUMBYSNES_TILE_EVICTION 1
+
+#if THUMBYSNES_TILE_EVICTION
+#define MAX_2BIT_TILES 256   /* 32 KB cache, 512 B bitmap, 512 B tags */
+#define MAX_4BIT_TILES 256   /* 32 KB cache, 512 B bitmap, 512 B tags */
+#define MAX_8BIT_TILES  64   /*  8 KB cache, 128 B bitmap, 128 B tags */
+#else
 #define MAX_2BIT_TILES 4096
 #define MAX_4BIT_TILES 2048
 #define MAX_8BIT_TILES 1024
+#endif
 
 #define PPU_H_BEAM_IRQ_SOURCE (1 << 0)
 #define PPU_V_BEAM_IRQ_SOURCE (1 << 1)
@@ -94,6 +112,9 @@ typedef struct
    uint32 FrameSkip;
    uint8*  TileCache [3];
    uint8*  TileCached [3];
+#if THUMBYSNES_TILE_EVICTION
+   uint16* TileTag   [3];   /* per-slot tag = TileNumber currently held */
+#endif
    bool8  FirstVRAMRead;
    bool8  LatchedInterlace;
    bool8  DoubleWidthPixels;
@@ -411,9 +432,9 @@ static INLINE void REGISTER_2118(uint8 Byte)
    }
    else
       Memory.VRAM[address = (PPU.VMA.Address << 1) & 0xFFFF] = Byte;
-   IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
-   IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
-   IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   IPPU.TileCached [TILE_2BIT][(address >> 4) & (MAX_2BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_4BIT][(address >> 5) & (MAX_4BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_8BIT][(address >> 6) & (MAX_8BIT_TILES - 1)] = FALSE;
    if (!PPU.VMA.High)
    {
 #ifdef DEBUGGER
@@ -437,9 +458,9 @@ static INLINE void REGISTER_2118_tile(uint8 Byte)
                (rem >> PPU.VMA.Shift) +
                ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3)) << 1) & 0xffff;
    Memory.VRAM [address] = Byte;
-   IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
-   IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
-   IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   IPPU.TileCached [TILE_2BIT][(address >> 4) & (MAX_2BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_4BIT][(address >> 5) & (MAX_4BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_8BIT][(address >> 6) & (MAX_8BIT_TILES - 1)] = FALSE;
    if (!PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2118] = Byte;
@@ -449,9 +470,9 @@ static INLINE void REGISTER_2118_linear(uint8 Byte)
 {
    uint32 address;
    Memory.VRAM[address = (PPU.VMA.Address << 1) & 0xFFFF] = Byte;
-   IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
-   IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
-   IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   IPPU.TileCached [TILE_2BIT][(address >> 4) & (MAX_2BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_4BIT][(address >> 5) & (MAX_4BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_8BIT][(address >> 6) & (MAX_8BIT_TILES - 1)] = FALSE;
    if (!PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2118] = Byte;
@@ -470,9 +491,9 @@ static INLINE void REGISTER_2119(uint8 Byte)
    }
    else
       Memory.VRAM[address = ((PPU.VMA.Address << 1) + 1) & 0xFFFF] = Byte;
-   IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
-   IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
-   IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   IPPU.TileCached [TILE_2BIT][(address >> 4) & (MAX_2BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_4BIT][(address >> 5) & (MAX_4BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_8BIT][(address >> 6) & (MAX_8BIT_TILES - 1)] = FALSE;
    if (PPU.VMA.High)
    {
 #ifdef DEBUGGER
@@ -495,9 +516,9 @@ static INLINE void REGISTER_2119_tile(uint8 Byte)
                        (rem >> PPU.VMA.Shift) +
                        ((rem & (PPU.VMA.FullGraphicCount - 1)) << 3)) << 1) + 1) & 0xFFFF;
    Memory.VRAM [address] = Byte;
-   IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
-   IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
-   IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   IPPU.TileCached [TILE_2BIT][(address >> 4) & (MAX_2BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_4BIT][(address >> 5) & (MAX_4BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_8BIT][(address >> 6) & (MAX_8BIT_TILES - 1)] = FALSE;
    if (PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2119] = Byte;
@@ -507,9 +528,9 @@ static INLINE void REGISTER_2119_linear(uint8 Byte)
 {
    uint32 address;
    Memory.VRAM[address = ((PPU.VMA.Address << 1) + 1) & 0xFFFF] = Byte;
-   IPPU.TileCached [TILE_2BIT][address >> 4] = FALSE;
-   IPPU.TileCached [TILE_4BIT][address >> 5] = FALSE;
-   IPPU.TileCached [TILE_8BIT][address >> 6] = FALSE;
+   IPPU.TileCached [TILE_2BIT][(address >> 4) & (MAX_2BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_4BIT][(address >> 5) & (MAX_4BIT_TILES - 1)] = FALSE;
+   IPPU.TileCached [TILE_8BIT][(address >> 6) & (MAX_8BIT_TILES - 1)] = FALSE;
    if (PPU.VMA.High)
       PPU.VMA.Address += PPU.VMA.Increment;
    //    Memory.FillRAM [0x2119] = Byte;

@@ -235,3 +235,80 @@ AND Phase 4+ tile-cache eviction AND probably one more knob
 whether we need the third knob until Phase 5 profiling on device — let
 it be driven by real measurements, not speculation.
 
+---
+
+## Phase 4 groundwork — tile cache eviction (2026-04-13)
+
+Implemented a direct-mapped hash cache for tile decoding, gated by
+`THUMBYSNES_TILE_EVICTION` in `ppu.h`. See the vendor patch list in
+`vendor/VENDORING.md`.
+
+### Design
+
+- `MAX_2BIT_TILES`, `MAX_4BIT_TILES`, `MAX_8BIT_TILES` become **slot counts**
+  (power of 2), not upstream's "one slot per possible TileNumber":
+  - 2bpp: 256 (was 4096) → 32 KB cache + 512 B bitmap + 512 B tags
+  - 4bpp: 256 (was 2048) → 32 KB cache + 512 B bitmap + 512 B tags
+  - 8bpp:  64 (was 1024) →  8 KB cache + 128 B bitmap + 128 B tags
+- New `uint16_t* IPPU.TileTag[3]` array: tag[slot] = TileNumber currently in
+  that slot. Set alongside `Buffered[slot]` on decode.
+- `TILE_PREAMBLE` macro rewritten: `slot = TileNumber & (SlotCount - 1)`;
+  cache hit iff `Buffered[slot] && Tag[slot] == TileNumber`; else re-decode.
+- Invalidation sites in `ppu.h` (VRAM register writes) mask indices with
+  `& (MAX_*BIT_TILES - 1)` so they target the slot, not a raw TileNumber.
+- `gfx.c` setup of `BG.Buffer`/`BG.Buffered` extended to also set `BG.Tag`
+  and `BG.BufferSlots`.
+
+### Measured impact (host, SMW, 120 frames)
+
+| | Before (Phase 2) | After (Phase 4 prep) | Δ |
+|---|---:|---:|---:|
+| Heap peak | 15,591 KB | **14,890 KB** | **-701 KB** |
+| Tile cache heap (bitmap+cache+tags) | 896 KB + 7 KB | **72 KB + 1 KB** | **-830 KB** |
+| SMW fps (idle title) | 108× realtime | 61×–139× realtime | within noise |
+
+Heap drop slightly less than the cache surgery alone would predict because
+some small allocations (~100 KB) drifted up; the net is still ≈-700 KB.
+
+### Regression test
+
+All 17 ROMs boot + bench 120 frames cleanly, fps in same range as before
+the eviction. Visual spot-check on SMW rendering pending.
+
+### Updated device projection
+
+With all surgeries (Phase 2 + tile eviction + Phase 4 scanline):
+
+| Region | KB |
+|---|---:|
+| WRAM + VRAM + ARAM + SRAM (capped 64) | 320 |
+| Memory struct (32-bit) | ~60 |
+| Tile caches (hash-evicted, 256/256/64 slots) | **~72** |
+| DMA buffer (shrunk) + Echo (shrunk) + sound | ~36 |
+| Other core BSS (IPPU, GSU, LineData, Settings, etc.) | ~70 |
+| GFX.Screen_buffer (per-scanline, Phase 4) | ~16 |
+| GFX.ZBuffer + SubZBuffer (per-scanline, Phase 4) | ~1 |
+| GFX.ZERO LUT → flash const (Phase 4 device build) | 0 |
+| Memory.ROM → XIP (Phase 4) | 0 |
+| **Subtotal emulator** | **~575 KB** |
+
+Against a ~390 KB emulator-state budget (520 total - 130 firmware overhead):
+**~185 KB still over**. Mostly from:
+- WRAM 128 + VRAM 64 + ARAM 64 = 256 KB, non-negotiable
+- Memory struct 60 KB, can't shrink without map-table redesign
+- Other core BSS ~70 KB
+
+Possible additional cuts to close the gap:
+- Cap or disable SubScreen/color-math path (Settings.Transparency=FALSE) —
+  saves the color-math-specific state, maybe 20-30 KB.
+- Shrink Memory map tables (Memory.Map / WriteMap / MemorySpeed) from
+  4096-entry to 2048-entry (LoROM/HiROM both map with 24-bit addresses
+  but only 8 MB effective, so 2048 might suffice) — saves ~24 KB.
+- Move Memory.VRAM to... wait, VRAM is mandatory writable, stays in SRAM.
+- Drop Settings / cheats-related struct fields entirely.
+
+Net: **fitting in 390 KB is still possible but requires ~185 KB more**,
+which means closing transparency and/or shrinking memory map. Both are
+surgical changes that can happen in Phase 4 alongside the scanline
+render. Still feasible, still tight, no comfortable margin.
+

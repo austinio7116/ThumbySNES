@@ -45,6 +45,28 @@ void SelectPalette();
 
 extern uint32 TileBlank;
 
+#if THUMBYSNES_TILE_EVICTION
+/* Hash-indexed tile cache: slot = TileNumber & (BufferSlots - 1).
+ * On collision (Tag[slot] != TileNumber) we evict + re-decode.
+ * Invalidation clears Buffered[slot] — tag compare above still catches
+ * any bit-depth aliasing that may alias onto the same slot. */
+#define TILE_PREAMBLE \
+    uint32 l; \
+    uint8 *pCache; \
+    uint32 TileAddr = (BG.TileAddress + ((Tile & 0x3ff) << BG.TileShift)) & 0xffff; \
+    uint32 TileNumber = TileAddr >> BG.TileShift; \
+    uint32 _tsnes_slot = TileNumber & (BG.BufferSlots - 1); \
+    pCache = &BG.Buffer[_tsnes_slot << 6]; \
+    if (!BG.Buffered[_tsnes_slot] || BG.Tag[_tsnes_slot] != TileNumber) { \
+        BG.Buffered[_tsnes_slot] = ConvertTile(pCache, TileAddr); \
+        BG.Tag[_tsnes_slot]      = (uint16)TileNumber; \
+    } \
+    if (BG.Buffered[_tsnes_slot] == BLANK_TILE) { \
+        TileBlank = Tile; \
+        return; \
+    } \
+    GFX.ScreenColors = &GFX.ScreenColorsPre[(Tile & GFX.PaletteMask) >> GFX.PaletteShift];
+#else
 #define TILE_PREAMBLE \
     uint32 l; \
     uint8 *pCache; \
@@ -63,6 +85,7 @@ extern uint32 TileBlank;
    } \
 \
     GFX.ScreenColors = &GFX.ScreenColorsPre[(Tile & GFX.PaletteMask) >> GFX.PaletteShift];
+#endif
 
 
 /*

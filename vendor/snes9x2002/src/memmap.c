@@ -187,6 +187,12 @@ bool8_32 MemoryInit ()
     IPPU.TileCached [TILE_2BIT] = (uint8 *) malloc (MAX_2BIT_TILES);
     IPPU.TileCached [TILE_4BIT] = (uint8 *) malloc (MAX_4BIT_TILES);
     IPPU.TileCached [TILE_8BIT] = (uint8 *) malloc (MAX_8BIT_TILES);
+#if THUMBYSNES_TILE_EVICTION
+    /* ThumbySNES: per-slot tag array for hash-indexed cache. */
+    IPPU.TileTag [TILE_2BIT] = (uint16 *) malloc (MAX_2BIT_TILES * sizeof(uint16));
+    IPPU.TileTag [TILE_4BIT] = (uint16 *) malloc (MAX_4BIT_TILES * sizeof(uint16));
+    IPPU.TileTag [TILE_8BIT] = (uint16 *) malloc (MAX_8BIT_TILES * sizeof(uint16));
+#endif
     
     if (!Memory.RAM || !Memory.SRAM || !Memory.VRAM || !Memory.ROM ||
         !IPPU.TileCache [TILE_2BIT] || !IPPU.TileCache [TILE_4BIT] ||
@@ -282,6 +288,11 @@ void MemoryDeinit ()
 	free ((char *) IPPU.TileCached [TILE_8BIT]);
 	IPPU.TileCached [TILE_8BIT] = NULL;
     }
+#if THUMBYSNES_TILE_EVICTION
+    if (IPPU.TileTag [TILE_2BIT]) { free(IPPU.TileTag [TILE_2BIT]); IPPU.TileTag [TILE_2BIT] = NULL; }
+    if (IPPU.TileTag [TILE_4BIT]) { free(IPPU.TileTag [TILE_4BIT]); IPPU.TileTag [TILE_4BIT] = NULL; }
+    if (IPPU.TileTag [TILE_8BIT]) { free(IPPU.TileTag [TILE_8BIT]); IPPU.TileTag [TILE_8BIT] = NULL; }
+#endif
 
     FreeSDD1Data ();
 

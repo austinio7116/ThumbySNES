@@ -828,6 +828,10 @@ void DrawOBJS(bool8_32 OnMain, uint8 D)
    BG.PaletteMask = 7;
    BG.Buffer = IPPU.TileCache [TILE_4BIT];
    BG.Buffered = IPPU.TileCached [TILE_4BIT];
+#if THUMBYSNES_TILE_EVICTION
+   BG.Tag = IPPU.TileTag [TILE_4BIT];
+   BG.BufferSlots = MAX_4BIT_TILES;
+#endif
    BG.NameSelect = PPU.OBJNameSelect;
    BG.DirectColourMode = FALSE;
 
@@ -2122,6 +2126,12 @@ static INLINE void DrawBackground(uint32 BGMode, uint32 bg, uint8 Z1, uint8 Z2)
    BG.NameSelect = 0;
    BG.Buffer = IPPU.TileCache [Depths [BGMode][bg]];
    BG.Buffered = IPPU.TileCached [Depths [BGMode][bg]];
+#if THUMBYSNES_TILE_EVICTION
+   BG.Tag = IPPU.TileTag [Depths [BGMode][bg]];
+   BG.BufferSlots = (Depths[BGMode][bg] == TILE_2BIT) ? MAX_2BIT_TILES
+                  : (Depths[BGMode][bg] == TILE_4BIT) ? MAX_4BIT_TILES
+                  :                                    MAX_8BIT_TILES;
+#endif
    BG.PaletteShift = PaletteShifts[BGMode][bg];
    BG.PaletteMask = PaletteMasks[BGMode][bg];
    BG.DirectColourMode = (BGMode == 3 || BGMode == 4) && bg == 0 &&

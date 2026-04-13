@@ -139,6 +139,15 @@ typedef struct
    uint8* Buffer;
    uint8* Buffered;
    bool8  DirectColourMode;
+#if THUMBYSNES_TILE_EVICTION
+   /* ThumbySNES: hash-indexed tile cache — see ppu.h. `Buffer` +
+    * `Buffered` now hold at most `BufferSlots` entries (power of two);
+    * `Tag[slot] = TileNumber` currently in that slot, used to detect
+    * hash collisions. Set alongside Buffer/Buffered in gfx.c's
+    * SetupBG path. */
+   uint16* Tag;
+   uint32  BufferSlots;
+#endif
 } SBG;
 
 typedef struct
