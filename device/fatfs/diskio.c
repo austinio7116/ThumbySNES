@@ -5,7 +5,7 @@
  */
 #include "ff.h"
 #include "diskio.h"
-#include "../nes_flash_disk.h"
+#include "../snes_flash_disk.h"
 
 DSTATUS disk_status(BYTE pdrv) {
     return (pdrv == 0) ? 0 : STA_NOINIT;
@@ -13,19 +13,19 @@ DSTATUS disk_status(BYTE pdrv) {
 
 DSTATUS disk_initialize(BYTE pdrv) {
     if (pdrv != 0) return STA_NOINIT;
-    nes_flash_disk_init();
+    snes_flash_disk_init();
     return 0;
 }
 
 DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
     if (pdrv != 0) return RES_PARERR;
-    return nes_flash_disk_read(buff, (uint32_t)sector, count) == 0 ? RES_OK : RES_ERROR;
+    return snes_flash_disk_read(buff, (uint32_t)sector, count) == 0 ? RES_OK : RES_ERROR;
 }
 
 #if FF_FS_READONLY == 0
 DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
     if (pdrv != 0) return RES_PARERR;
-    return nes_flash_disk_write(buff, (uint32_t)sector, count) == 0 ? RES_OK : RES_ERROR;
+    return snes_flash_disk_write(buff, (uint32_t)sector, count) == 0 ? RES_OK : RES_ERROR;
 }
 #endif
 
@@ -35,10 +35,10 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
     case CTRL_SYNC:
         return RES_OK;
     case GET_SECTOR_COUNT:
-        *(LBA_t *)buff = (LBA_t)nes_flash_disk_sector_count();
+        *(LBA_t *)buff = (LBA_t)snes_flash_disk_sector_count();
         return RES_OK;
     case GET_SECTOR_SIZE:
-        *(WORD *)buff = (WORD)nes_flash_disk_sector_size();
+        *(WORD *)buff = (WORD)snes_flash_disk_sector_size();
         return RES_OK;
     case GET_BLOCK_SIZE:
         *(DWORD *)buff = 8;   /* erase block / sector size = 4096/512 */
