@@ -31,10 +31,62 @@
 #define FB_W 128
 #define FB_H 128
 
-/* No per-scanline callback on device: the PPU composites RGB565
- * straight into the LCD framebuffer at native resolution. The old
- * 7:4 2x2-blend downscale path is gone — snes_set_lcd_mode owns the
- * sx/sy tables for the 224² → 128² mapping. See src/snes_core.c. */
+/* FILL: 224 of the 256-pixel SNES line maps to 128 device columns,
+ * sampling stride 7:4 with a 2x2 RGB565 blend. Vertical mapping is
+ * symmetric — but it's done per-line using the callback's `line` arg.
+ *
+ * Note: the native-LCD fast path (snes_set_lcd_mode in snes_core) is
+ * available but produces a nearest-neighbour 7:4 downscale which is
+ * too aliased for text-heavy SNES content. We keep the 2x2 blend
+ * callback as the default to preserve readability. */
+#define FILL_X_CROP 16
+#define FILL_SRC    224
+
+static inline uint16_t rgb565_avg2(uint16_t a, uint16_t b) {
+    uint32_t rsum = ((a >> 11) & 0x1F) + ((b >> 11) & 0x1F);
+    uint32_t gsum = ((a >>  5) & 0x3F) + ((b >>  5) & 0x3F);
+    uint32_t bsum = (a & 0x1F) + (b & 0x1F);
+    return (uint16_t)(((rsum >> 1) << 11) | ((gsum >> 1) << 5) | (bsum >> 1));
+}
+
+static uint16_t *s_lcd_target = NULL;
+static uint16_t  s_blend_a[FB_W];
+static int       s_blend_a_dev_y = -1;
+
+static void __attribute__((section(".time_critical.snes_blit")))
+    on_scanline(void *user, int line, const uint8_t *lineBuffer)
+{
+    (void)user;
+    if (line < 1 || line > 224) return;
+    int sy = line - 1;
+    int dev_y = (sy * 4) / 7;
+    if (dev_y >= FB_H) return;
+
+    uint16_t row_blended[FB_W];
+    for (int ox = 0; ox < FB_W; ox++) {
+        int sx  = ((ox * 7) >> 2) + FILL_X_CROP;
+        int sx2 = sx + 1; if (sx2 > FILL_X_CROP + FILL_SRC - 1) sx2 = FILL_X_CROP + FILL_SRC - 1;
+        const uint8_t *p1 = lineBuffer + sx  * 8;
+        const uint8_t *p2 = lineBuffer + sx2 * 8;
+        /* XBGR layout (ppu_pixelOutputFormatXBGR): byte0 = B, 1 = G, 2 = R, 3 = X. */
+        uint16_t c1 = (uint16_t)(((uint16_t)(p1[2] >> 3) << 11) | ((uint16_t)(p1[1] >> 2) << 5) | (uint16_t)(p1[0] >> 3));
+        uint16_t c2 = (uint16_t)(((uint16_t)(p2[2] >> 3) << 11) | ((uint16_t)(p2[1] >> 2) << 5) | (uint16_t)(p2[0] >> 3));
+        row_blended[ox] = rgb565_avg2(c1, c2);
+    }
+
+    if (s_blend_a_dev_y == dev_y) {
+        uint16_t *out = s_lcd_target + dev_y * FB_W;
+        for (int x = 0; x < FB_W; x++) out[x] = rgb565_avg2(s_blend_a[x], row_blended[x]);
+        s_blend_a_dev_y = -1;
+    } else {
+        if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
+            uint16_t *out = s_lcd_target + s_blend_a_dev_y * FB_W;
+            memcpy(out, s_blend_a, sizeof(s_blend_a));
+        }
+        memcpy(s_blend_a, row_blended, sizeof(row_blended));
+        s_blend_a_dev_y = dev_y;
+    }
+}
 
 /* Map Thumby physical buttons to the SNES pad bitmask snes_core expects.
  * YX profile (see PLAN.md §7): A→SNES A, B→SNES B, LB→SNES Y, RB→SNES X.
@@ -100,19 +152,15 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         return -2;
     }
 
-    /* Native-LCD render path (replaces the old per-scanline blend
-     * callback). PPU composites RGB565 directly into `fb` at 128x128,
-     * sampling 128 source x's per line from the 224-wide cropped region,
-     * and skipping SNES lines that don't map to a device row. Cuts
-     * ~3× off per-pixel work versus the old 224x224-then-downscale
-     * pipeline. */
+    s_lcd_target = fb;
+    s_blend_a_dev_y = -1;
+    snes_set_scanline_cb(on_scanline, NULL);
+    /* Performance: skip subscreen / colour-math fetch. Loses HUD fade
+     * effects + transparency but cuts per-pixel work nearly in half. */
     snes_set_skip_color_math(1);
-    snes_set_lcd_mode(fb, FB_W, FB_H);
-    /* Frameskip: alternate frames skip per-pixel compositing while
-     * CPU + APU still advance normally. Halves remaining PPU cost at
-     * the price of ~halved effective refresh rate. Value 1 = render
-     * every other frame. Set to 0 to disable. */
-    snes_set_frameskip(1);
+    /* FILL mode crops 16 px off each horizontal edge — tell PPU to
+     * skip those pixels instead of rendering them and discarding. */
+    snes_set_render_x_range(FILL_X_CROP, FILL_X_CROP + FILL_SRC);
 
     /* MENU button: long-press (>= 800 ms) exits to picker. A short
      * press is forwarded as SNES Start. We send Start for the whole
@@ -148,7 +196,12 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         menu_was_down = menu_now;
 
         snes_set_pad(snes_read_pad(send_start));
+        s_blend_a_dev_y = -1;
         snes_run_frame();
+        if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
+            memcpy(s_lcd_target + s_blend_a_dev_y * FB_W, s_blend_a, sizeof(s_blend_a));
+            s_blend_a_dev_y = -1;
+        }
         /* FPS overlay in top-left — small, ~24×8 px so it covers as
          * little of the picture as possible. Refreshes once per second. */
         fps_frames++;
