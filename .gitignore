@@ -1,6 +1,8 @@
 build/
 build_device/
 build_asan/
+build_prof/
+gmon.out
 *.o
 *.obj
 *.a

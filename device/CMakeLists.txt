@@ -1,10 +1,11 @@
 #
-# ThumbySNES — device firmware build.
+# ThumbySNES — device firmware build (LakeSnes core).
 #
 # Build:
 #   cd ThumbySNES
 #   cmake -B build_device -S device \
-#         -DPICO_SDK_PATH=/home/maustin/mp-thumby/lib/pico-sdk
+#         -DPICO_SDK_PATH=/home/maustin/mp-thumby/lib/pico-sdk \
+#         -DTHUMBYSNES_LINK_CORE=ON
 #   cmake --build build_device -j8
 #
 # Output: build_device/snesrun_device.uf2
@@ -25,96 +26,43 @@ pico_sdk_init()
 set(SNES_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
 
 # ----------------------------------------------------------------------
-# Vendored snes9x2002 — only linked in Phase 4+. Phase 3 firmware is
-# emulator-less (snes_run.c is a stub splash) so we skip compiling the
-# ~60-file core on every device build until we actually call into it.
-# Set THUMBYSNES_LINK_CORE=ON at CMake time to include it:
-#   cmake -B build_device -S device -DTHUMBYSNES_LINK_CORE=ON ...
+# Vendored LakeSnes (MIT — see vendor/lakesnes/LICENSE.txt + VENDORING.md)
+# Phase 4 default OFF so picker-only firmware iterations don't recompile
+# the ~6500 LOC core. Pass -DTHUMBYSNES_LINK_CORE=ON for the playable
+# firmware.
 # ----------------------------------------------------------------------
-option(THUMBYSNES_LINK_CORE "Link the snes9x2002 core into the firmware" OFF)
+option(THUMBYSNES_LINK_CORE "Link the LakeSnes core into the firmware" OFF)
 
 if(THUMBYSNES_LINK_CORE)
-    set(S9X_DIR    ${SNES_ROOT}/vendor/snes9x2002)
-    set(S9X_SRC    ${S9X_DIR}/src)
-    set(S9X_COMMON ${S9X_DIR}/libretro/libretro-common)
-
-    # Build-time generator: emits gfx_zero_table.c embedding the 128 KB
-    # RGB565 colour-math LUT as a const array. Compiled into the core
-    # as read-only flash data — removes the matching 128 KB heap alloc
-    # snes9x2002's S9xGraphicsInit does by default.
-    set(GFX_ZERO_TBL ${CMAKE_CURRENT_BINARY_DIR}/gfx_zero_table.c)
-    set(GFX_ZERO_GEN ${CMAKE_CURRENT_BINARY_DIR}/gen_gfx_zero)
-    add_custom_command(
-        OUTPUT  ${GFX_ZERO_GEN}
-        COMMAND cc -O2 -o ${GFX_ZERO_GEN} ${SNES_ROOT}/tools/gen_gfx_zero.c
-        DEPENDS ${SNES_ROOT}/tools/gen_gfx_zero.c
-        VERBATIM
-    )
-    add_custom_command(
-        OUTPUT  ${GFX_ZERO_TBL}
-        COMMAND ${GFX_ZERO_GEN} ${GFX_ZERO_TBL}
-        DEPENDS ${GFX_ZERO_GEN}
-        VERBATIM
-    )
-
-    set(SNES9X2002_CORE_SRC
-        ${S9X_SRC}/apu.c          ${S9X_SRC}/apuaux.c
-        ${S9X_SRC}/c4.c           ${S9X_SRC}/c4emu.c
-        ${S9X_SRC}/clip.c         ${S9X_SRC}/data.c
-        ${S9X_SRC}/dsp1.c         ${S9X_SRC}/fxemu.c
-        ${S9X_SRC}/fxinst.c       ${S9X_SRC}/globals.c
-        ${S9X_SRC}/dma.c          ${S9X_SRC}/memmap.c
-        ${S9X_SRC}/cpu.c          ${S9X_SRC}/cpuexec.c
-        ${S9X_SRC}/cpuops.c       ${S9X_SRC}/sdd1.c
-        ${S9X_SRC}/sdd1emu.c      ${S9X_SRC}/snapshot.c
-        ${S9X_SRC}/soundux.c      ${S9X_SRC}/spc700.c
-        ${S9X_SRC}/srtc.c
-        ${S9X_SRC}/ppu_.c         ${S9X_SRC}/gfx.c
-        ${S9X_SRC}/tile.c
-        ${S9X_COMMON}/streams/memory_stream.c
+    set(LK_SRC ${SNES_ROOT}/vendor/lakesnes/snes)
+    set(LAKESNES_CORE_SRC
+        ${LK_SRC}/apu.c          ${LK_SRC}/cart.c
+        ${LK_SRC}/cpu.c          ${LK_SRC}/dma.c
+        ${LK_SRC}/dsp.c          ${LK_SRC}/input.c
+        ${LK_SRC}/ppu.c          ${LK_SRC}/snes.c
+        ${LK_SRC}/snes_other.c   ${LK_SRC}/spc.c
+        ${LK_SRC}/statehandler.c
         ${SNES_ROOT}/src/snes_core.c
-        ${GFX_ZERO_TBL}
     )
 
-    add_library(snes9x2002_dev STATIC ${SNES9X2002_CORE_SRC})
-    target_include_directories(snes9x2002_dev PUBLIC
-        ${S9X_SRC}
-        ${S9X_DIR}/libretro
-        ${S9X_COMMON}/include
-        ${SNES_ROOT}/src
-    )
-    target_compile_definitions(snes9x2002_dev PUBLIC
-        __LIBRETRO__
-        HAVE_STDINT_H
-        HAVE_INTTYPES_H
-        HAVE_STRINGS_H
-        USE_SA1
-        __OLD_RASTER_FX__
+    add_library(lakesnes_dev STATIC ${LAKESNES_CORE_SRC})
+    target_include_directories(lakesnes_dev PUBLIC ${LK_SRC} ${SNES_ROOT}/src)
+    target_compile_definitions(lakesnes_dev PUBLIC
         THUMBYSNES_HAVE_CORE=1
-        # Point GFX.ZERO at the flash-resident LUT (gfx_zero_table.c)
-        # instead of malloc + runtime compute — saves 128 KB SRAM.
-        THUMBYSNES_FLASH_GFX_ZERO=1
-        # Alias SubScreen onto Screen + force Settings.Transparency=FALSE.
-        # Loses SNES colour-math effects (HUD fades, transparency). Saves
-        # ~225 KB SRAM. See snes_init_gfx_buffers in snes_core.c.
-        THUMBYSNES_DISABLE_TRANSPARENCY=1
-        # Place hot loops in SRAM for flash-XIP cache-miss avoidance.
-        # Device-only — on host builds this expands to nothing.
-        "IRAM_ATTR=__attribute__((section(\".time_critical.snes\")))"
+        # LAKESNES_HOT macro → puts marked functions in .time_critical.snes
+        # which the Pico SDK linker copies to SRAM at boot. Avoids flash
+        # XIP cache misses on the inner emulator loop.
+        LAKESNES_HOT_SRAM=1
     )
-    target_compile_options(snes9x2002_dev PRIVATE
-        -O3 -fomit-frame-pointer -ffast-math -fstrict-aliasing
+    target_compile_options(lakesnes_dev PRIVATE
+        -O3 -fomit-frame-pointer -fstrict-aliasing
         -ffunction-sections -fdata-sections
-        -Wno-array-bounds -Wno-format -Wno-unused-parameter
-        -Wno-unused-function -Wno-unused-variable
-        -Wno-unused-but-set-variable -Wno-sign-compare
-        -Wno-pointer-sign -Wno-implicit-function-declaration
-        -Wno-parentheses
+        -Wno-unused-parameter -Wno-unused-but-set-variable
     )
 endif()
 
 # ----------------------------------------------------------------------
-# snesrun_device — Phase 3 firmware: lobby + picker + stub emulator.
+# snesrun_device firmware
 # ----------------------------------------------------------------------
 add_executable(snesrun_device
     snes_device_main.c
@@ -159,7 +107,7 @@ target_link_libraries(snesrun_device PRIVATE
     tinyusb_board
 )
 if(THUMBYSNES_LINK_CORE)
-    target_link_libraries(snesrun_device PRIVATE snes9x2002_dev)
+    target_link_libraries(snesrun_device PRIVATE lakesnes_dev)
 endif()
 pico_enable_stdio_usb(snesrun_device 0)
 pico_enable_stdio_uart(snesrun_device 0)

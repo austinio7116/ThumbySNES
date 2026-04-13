@@ -1,19 +1,16 @@
 /*
- * ThumbySNES — snes_run.c (Phase 4 device emulator driver).
+ * ThumbySNES — snes_run.c (Phase 4 device emulator driver, LakeSnes core).
  *
  * Picker hands us the chosen ROM. We:
  *   1. mmap it from flash XIP (zero copy),
- *   2. call snes_load_xip so snes9x2002 uses the XIP pointer directly
- *      (no 6 MB ROM buffer in SRAM),
- *   3. per frame: poll buttons, step one frame, 2x2 RGB565 downscale
- *      GFX.Screen (256x224 stride-640) into the 128x128 LCD framebuffer
- *      with FILL cropping (same math as sneshost), present.
- *   4. exit on MENU.
+ *   2. snes_load_xip — LakeSnes Cart->rom points at flash directly,
+ *   3. install a per-scanline callback that downscales each line into
+ *      the 128x128 LCD framebuffer (FILL mode 7:4 + 2x2 RGB565 blend),
+ *   4. per frame: poll buttons, snes_run_frame (callback fires 224x),
+ *      LCD present, repeat,
+ *   5. exit on MENU.
  *
- * Audio is stubbed for Phase 4. Phase 5 wires the PWM path to snes_get_audio.
- *
- * Falls back to snes_load (heap copy) if the ROM isn't contiguous in
- * flash — happens rarely but the picker doesn't defrag in Phase 3.
+ * Audio is stubbed for Phase 4. Phase 5 wires the PWM path.
  */
 #include "snes_run.h"
 #include "snes_font.h"
@@ -29,25 +26,28 @@
 #if THUMBYSNES_HAVE_CORE
 #include "snes_core.h"
 #include "snes_picker.h"
-/* Pull snes9x2002's GFX struct so we can sample the framebuffer after
- * each frame. GFX.Screen is a uint8* whose rows are GFX_PITCH (640 B)
- * bytes apart; each pixel is a uint16 RGB565. */
-#include "gfx.h"
 
 #define FB_W 128
 #define FB_H 128
-#define SNES_W 256
-#define SNES_H 224
 
-/* FILL mode — 224x224 crop from 256x224 (16 px each side) → 128x128
- * via 7:4 stride with 2x2 RGB565 blend. Identical to sneshost's
- * downscale_fill, just reading from snes9x2002's GFX.Screen with
- * its 640-byte row pitch. */
+/* FILL: 224 of the 256-pixel SNES line maps to 128 device columns,
+ * sampling stride 7:4 with a 2x2 RGB565 blend. Vertical mapping is
+ * symmetric — but it's done per-line using the callback's `line` arg. */
 #define FILL_X_CROP 16
 #define FILL_SRC    224
 
-static inline uint16_t rgb565_avg2x2(uint16_t a, uint16_t b,
-                                     uint16_t c, uint16_t d) {
+static inline uint16_t rgb565_avg2(uint16_t a, uint16_t b) {
+    /* 1D average of two RGB565 pixels — used inside the per-line
+     * callback to halve the horizontal pair before saving for the
+     * vertical pair on the next line. */
+    uint32_t rsum = ((a >> 11) & 0x1F) + ((b >> 11) & 0x1F);
+    uint32_t gsum = ((a >>  5) & 0x3F) + ((b >>  5) & 0x3F);
+    uint32_t bsum = (a & 0x1F) + (b & 0x1F);
+    return (uint16_t)(((rsum >> 1) << 11) | ((gsum >> 1) << 5) | (bsum >> 1));
+}
+
+static inline uint16_t rgb565_avg4(uint16_t a, uint16_t b,
+                                   uint16_t c, uint16_t d) {
     uint32_t rsum = ((a >> 11) & 0x1F) + ((b >> 11) & 0x1F)
                   + ((c >> 11) & 0x1F) + ((d >> 11) & 0x1F);
     uint32_t gsum = ((a >>  5) & 0x3F) + ((b >>  5) & 0x3F)
@@ -56,60 +56,93 @@ static inline uint16_t rgb565_avg2x2(uint16_t a, uint16_t b,
     return (uint16_t)(((rsum >> 2) << 11) | ((gsum >> 2) << 5) | (bsum >> 2));
 }
 
-/* GFX.Screen row stride is 640 B = 320 uint16. We only sample the
- * first 256 pixels of each row (SNES visible width). */
-#define GFX_ROW_PX 320
+/* Per-scanline output callback installed via snes_set_scanline_cb.
+ *
+ * `lineBuffer` is BGRX_BGRX_ × 256 (8 bytes per pixel, the format
+ * LakeSnes's PPU writes — first 4 bytes are the main pixel, second 4
+ * are the "sub" pixel for hires; we use just the main).
+ *
+ * We hold a 1-line ring of 128 RGB565 pixels (`s_prev`) so we can
+ * pair this line with the previous and 2x2-blend into a single output
+ * row. With 7:4 vertical, every odd output row uses (sy, sy+1) =
+ * (current, current+1) — but we don't have "next line" yet; instead
+ * we map (sy, sy-1) using the previous line.
+ *
+ * Output mapping (FILL): for each device row oy in [0, 128):
+ *   src_y = (oy * 7) >> 2   ∈ [0, 224)
+ * which means SNES line `sy` maps to device row `oy = (sy * 4) / 7`.
+ * We accumulate per device row when the source line crosses the threshold.
+ */
+
+static uint16_t *s_lcd_target = NULL;          /* points at caller's fb */
+static uint16_t  s_blend_a[FB_W];              /* horizontal-blended row from previous SNES line */
+static int       s_blend_a_dev_y = -1;         /* which device row s_blend_a maps onto, or -1 */
 
 static void __attribute__((section(".time_critical.snes_blit")))
-    blit_fill_to_lcd(uint16_t *lcd_fb) {
-    const uint16_t *src0 = (const uint16_t *)GFX.Screen;
-    for (int oy = 0; oy < FB_H; oy++) {
-        int sy  = (oy * 7) >> 2;                  /* 0..223 */
-        int sy2 = sy + 1; if (sy2 > FILL_SRC - 1) sy2 = FILL_SRC - 1;
-        const uint16_t *r0 = src0 + sy  * GFX_ROW_PX + FILL_X_CROP;
-        const uint16_t *r1 = src0 + sy2 * GFX_ROW_PX + FILL_X_CROP;
-        uint16_t *out = lcd_fb + oy * FB_W;
-        for (int ox = 0; ox < FB_W; ox++) {
-            int sx  = (ox * 7) >> 2;              /* 0..223 */
-            int sx2 = sx + 1; if (sx2 > FILL_SRC - 1) sx2 = FILL_SRC - 1;
-            out[ox] = rgb565_avg2x2(r0[sx], r0[sx2], r1[sx], r1[sx2]);
+    on_scanline(void *user, int line, const uint8_t *lineBuffer)
+{
+    (void)user;
+    if (line < 1 || line > 224) return;
+    /* SNES line index 0..223 (callback uses 1..224). */
+    int sy = line - 1;
+
+    /* Compute device row from sy — same 7:4 stride sneshost uses.
+     * floor(sy * 4 / 7) gives 0..127. Two consecutive sy can map to the
+     * same dev_y; we 2x2-blend across them. */
+    int dev_y = (sy * 4) / 7;
+    if (dev_y >= FB_H) return;
+
+    /* 1) Convert this SNES line to BGRX pairs → RGB565 pairs at every
+     *    other source x (FILL crop: x = 16..239 of source, then 7:4
+     *    horizontal stride to 128). For each device column we average
+     *    the two horizontally-adjacent source samples. */
+    uint16_t row_blended[FB_W];
+    for (int ox = 0; ox < FB_W; ox++) {
+        int sx  = ((ox * 7) >> 2) + FILL_X_CROP;
+        int sx2 = sx + 1; if (sx2 > FILL_X_CROP + FILL_SRC - 1) sx2 = FILL_X_CROP + FILL_SRC - 1;
+        const uint8_t *p1 = lineBuffer + sx  * 8;
+        const uint8_t *p2 = lineBuffer + sx2 * 8;
+        /* XBGR layout (we set ppu_pixelOutputFormatXBGR): byte0 = B, 1 = G, 2 = R, 3 = X. */
+        uint16_t c1 = (uint16_t)(((uint16_t)(p1[2] >> 3) << 11) | ((uint16_t)(p1[1] >> 2) << 5) | (uint16_t)(p1[0] >> 3));
+        uint16_t c2 = (uint16_t)(((uint16_t)(p2[2] >> 3) << 11) | ((uint16_t)(p2[1] >> 2) << 5) | (uint16_t)(p2[0] >> 3));
+        row_blended[ox] = rgb565_avg2(c1, c2);
+    }
+
+    /* 2) If this line belongs to a NEW device row, flush the
+     *    previously-pending row by averaging it with this one (2x2
+     *    blend). Else (same dev_y as previous), the previous line was
+     *    the only contributor — write it through. */
+    if (s_blend_a_dev_y == dev_y) {
+        /* Two SNES lines mapping to the same device row → blend them. */
+        uint16_t *out = s_lcd_target + dev_y * FB_W;
+        for (int x = 0; x < FB_W; x++) out[x] = rgb565_avg2(s_blend_a[x], row_blended[x]);
+        s_blend_a_dev_y = -1;
+    } else {
+        /* Stash this line for possible blend next callback. */
+        if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
+            uint16_t *out = s_lcd_target + s_blend_a_dev_y * FB_W;
+            memcpy(out, s_blend_a, sizeof(s_blend_a));
         }
+        memcpy(s_blend_a, row_blended, sizeof(row_blended));
+        s_blend_a_dev_y = dev_y;
     }
 }
 
 /* Map Thumby physical buttons to the SNES pad bitmask snes_core expects.
- * YX profile (see PLAN.md §7): A→SNES A, B→SNES B, LB→SNES Y, RB→SNES X. */
-static uint16_t snes_read_pad(void) {
-    uint16_t p = 0;
-    if (snes_buttons_is_pressed(SNES_BTN_UP))    p |= SNES_BTN_UP   | 0; /* see core pad bits */
-    /* NB: SNES_BTN_* in our button enum conflict with the SNES pad
-     * bitmask macros defined in snes_core.h. Use the core macros
-     * explicitly here. */
-    (void)p;
-    extern int snes_buttons_is_pressed(int); /* silence */
+ * YX profile (see PLAN.md §7): A→SNES A, B→SNES B, LB→SNES Y, RB→SNES X.
+ * MENU is *not* mapped here — it's handled separately by the run-loop:
+ * long-press exits, short-press passes through as SNES Start. */
+static uint16_t snes_read_pad(bool send_start) {
     uint16_t bits = 0;
-    #define CORE_UP     (1u << 11)
-    #define CORE_DOWN   (1u << 10)
-    #define CORE_LEFT   (1u <<  9)
-    #define CORE_RIGHT  (1u <<  8)
-    #define CORE_A      (1u <<  7)
-    #define CORE_X      (1u <<  6)
-    #define CORE_L      (1u <<  5)
-    #define CORE_R      (1u <<  4)
-    #define CORE_START  (1u << 12)
-    #define CORE_SELECT (1u << 13)
-    #define CORE_Y      (1u << 14)
-    #define CORE_B      (1u << 15)
-    if (snes_buttons_is_pressed(SNES_BTN_UP))    bits |= CORE_UP;
-    if (snes_buttons_is_pressed(SNES_BTN_DOWN))  bits |= CORE_DOWN;
-    if (snes_buttons_is_pressed(SNES_BTN_LEFT))  bits |= CORE_LEFT;
-    if (snes_buttons_is_pressed(SNES_BTN_RIGHT)) bits |= CORE_RIGHT;
-    if (snes_buttons_is_pressed(SNES_BTN_A))     bits |= CORE_A;
-    if (snes_buttons_is_pressed(SNES_BTN_B))     bits |= CORE_B;
-    if (snes_buttons_is_pressed(SNES_BTN_LB))    bits |= CORE_Y;
-    if (snes_buttons_is_pressed(SNES_BTN_RB))    bits |= CORE_X;
-    /* MENU short = SNES Start; MENU handled separately to also exit. */
-    if (snes_buttons_is_pressed(SNES_BTN_MENU))  bits |= CORE_START;
+    if (snes_buttons_is_pressed(SNES_BTN_UP))    bits |= (1u << 11);
+    if (snes_buttons_is_pressed(SNES_BTN_DOWN))  bits |= (1u << 10);
+    if (snes_buttons_is_pressed(SNES_BTN_LEFT))  bits |= (1u <<  9);
+    if (snes_buttons_is_pressed(SNES_BTN_RIGHT)) bits |= (1u <<  8);
+    if (snes_buttons_is_pressed(SNES_BTN_A))     bits |= (1u <<  7);
+    if (snes_buttons_is_pressed(SNES_BTN_B))     bits |= (1u << 15);
+    if (snes_buttons_is_pressed(SNES_BTN_LB))    bits |= (1u << 14); /* Y */
+    if (snes_buttons_is_pressed(SNES_BTN_RB))    bits |= (1u <<  6); /* X */
+    if (send_start)                              bits |= (1u << 12); /* Start */
     return bits;
 }
 
@@ -136,37 +169,21 @@ static void draw_error(uint16_t *fb, const char *msg) {
     }
 }
 
-/* Tiny progress splash — if the core hard-faults during init the last
- * message on-screen identifies where. Keep the messages short so the
- * 5×7 font fits inside a 128-pixel row. */
-static void draw_progress(uint16_t *fb, const char *msg) {
-    /* Clear only the bottom line — leaves the "loading: rom name" above. */
-    for (int y = 76; y < 128; y++)
-        for (int x = 0; x < 128; x++) fb[y * 128 + x] = 0;
-    snes_font_draw(fb, msg, 2, 82, 0x7BEF);
-    snes_lcd_present(fb);
-}
-
 int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
     draw_loading(fb, rom->name);
 
-    /* Zero-copy XIP path first — snes9x2002 reads Memory.ROM from flash
-     * directly. Falls back to a heap copy if the FAT cluster chain is
-     * fragmented (snes_picker_mmap_rom returns non-zero). */
-    draw_progress(fb, "mmap rom...");
+    /* Zero-copy XIP first — Cart->rom points at flash. Fallback to a
+     * heap copy if the FAT cluster chain isn't contiguous. */
     const uint8_t *rom_data = NULL;
     size_t         rom_len  = 0;
     int xip_ok = snes_picker_mmap_rom(rom->name, &rom_data, &rom_len);
     snes_result_t r;
     uint8_t *heap_rom = NULL;
     if (xip_ok == 0) {
-        draw_progress(fb, "core init (xip)...");
         r = snes_load_xip(rom_data, rom_len);
     } else {
-        draw_progress(fb, "slurping rom...");
         heap_rom = snes_picker_load_rom(rom->name, &rom_len);
         if (!heap_rom) { draw_error(fb, "open failed"); return -1; }
-        draw_progress(fb, "core init (heap)...");
         r = snes_load(heap_rom, rom_len);
     }
     if (r != SNES_OK) {
@@ -174,22 +191,76 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         draw_error(fb, r == SNES_ERR_OOM ? "out of memory" : "bad ROM");
         return -2;
     }
-    draw_progress(fb, "running...");
 
-    /* Main emulator loop — no frame-rate pacing yet (device drives as
-     * fast as it can; we'll add 60 Hz pacing in Phase 5 once we know
-     * whether we're CPU-bound). */
+    s_lcd_target = fb;
+    s_blend_a_dev_y = -1;
+    snes_set_scanline_cb(on_scanline, NULL);
+    /* Performance: skip subscreen / colour-math fetch. Loses HUD fade
+     * effects + transparency but cuts per-pixel work nearly in half. */
+    snes_set_skip_color_math(1);
+    /* FILL mode crops 16 px off each horizontal edge — tell PPU to
+     * skip those pixels instead of rendering them and discarding. */
+    snes_set_render_x_range(FILL_X_CROP, FILL_X_CROP + FILL_SRC);
+
+    /* MENU button: long-press (>= 800 ms) exits to picker. A short
+     * press is forwarded as SNES Start. We send Start for the whole
+     * time MENU is held until the long-press threshold elapses, so
+     * games that need Start to be held briefly (most title screens)
+     * see it. */
+    #define MENU_HOLD_EXIT_MS 800
+    absolute_time_t menu_press_t = nil_time;
+    bool menu_was_down = false;
+
     int exit_pressed = 0;
+    int frame = 0;
+    /* Tiny FPS counter — top-left corner. Updated once per second. */
+    char fps_str[8] = {0};
+    int  fps_frames = 0;
+    absolute_time_t fps_window_start = get_absolute_time();
     while (!exit_pressed) {
         snes_buttons_poll();
-        /* MENU long-press to exit — Phase 3 stub used short press. We
-         * treat any MENU release as exit for now. */
-        if (snes_buttons_just_pressed(SNES_BTN_MENU)) exit_pressed = 1;
 
-        snes_set_pad(snes_read_pad());
+        bool menu_now = snes_buttons_is_pressed(SNES_BTN_MENU);
+        bool send_start = false;
+        if (menu_now) {
+            if (!menu_was_down) menu_press_t = get_absolute_time();
+            int held_ms = (int)(absolute_time_diff_us(menu_press_t,
+                                  get_absolute_time()) / 1000);
+            if (held_ms >= MENU_HOLD_EXIT_MS) {
+                exit_pressed = 1;
+            } else {
+                /* Short press in progress — forward as SNES Start. */
+                send_start = true;
+            }
+        }
+        menu_was_down = menu_now;
+
+        snes_set_pad(snes_read_pad(send_start));
+        s_blend_a_dev_y = -1;
         snes_run_frame();
-        blit_fill_to_lcd(fb);
+        if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
+            memcpy(s_lcd_target + s_blend_a_dev_y * FB_W, s_blend_a, sizeof(s_blend_a));
+            s_blend_a_dev_y = -1;
+        }
+        /* FPS overlay in top-left — small, ~24×8 px so it covers as
+         * little of the picture as possible. Refreshes once per second. */
+        fps_frames++;
+        absolute_time_t now = get_absolute_time();
+        int64_t window_us = absolute_time_diff_us(fps_window_start, now);
+        if (window_us >= 1000000) {
+            int fps10 = (int)((int64_t)fps_frames * 10000000 / window_us);
+            snprintf(fps_str, sizeof(fps_str), "%d.%d", fps10 / 10, fps10 % 10);
+            fps_frames = 0;
+            fps_window_start = now;
+        }
+        if (fps_str[0]) {
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 24; x++) fb[y * FB_W + x] = 0x0000;
+            snes_font_draw(fb, fps_str, 1, 0, 0xFFE0);
+        }
+
         snes_lcd_present(fb);
+        frame++;
     }
 
     snes_unload();
@@ -202,23 +273,18 @@ int snes_run_clock_override(const char *rom_name) {
     return 0;
 }
 
-#else /* !THUMBYSNES_HAVE_CORE — Phase 3 stub (unchanged) */
+#else /* !THUMBYSNES_HAVE_CORE — Phase 3 stub */
 
 #define FB_W 128
 #define FB_H 128
 
 int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
     memset(fb, 0, FB_W * FB_H * sizeof(uint16_t));
-    snes_font_draw(fb, "loading...",    24, 44, 0xFFFF);
-    char buf[24];
-    size_t L = strlen(rom->name);
-    if (L >= 22) { memcpy(buf, rom->name, 21); buf[21] = 0; }
-    else         { memcpy(buf, rom->name, L + 1); }
-    snes_font_draw(fb, buf, 2, 60, 0xCE59);
-    snes_font_draw(fb, "Phase 3 stub — no core yet",  0, 80, 0x6B4D);
-    snes_font_draw(fb, "MENU to return",             18, 100, 0xCE59);
+    snes_font_draw(fb, "loading...", 24, 44, 0xFFFF);
+    snes_font_draw(fb, rom->name,     2, 60, 0xCE59);
+    snes_font_draw(fb, "no core",    36, 80, 0x6B4D);
+    snes_font_draw(fb, "MENU to return", 18, 100, 0xCE59);
     snes_lcd_present(fb);
-
     absolute_time_t deadline = make_timeout_time_ms(3000);
     while (!time_reached(deadline)) {
         snes_buttons_poll();

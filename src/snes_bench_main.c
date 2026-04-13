@@ -53,11 +53,23 @@ int main(int argc, char **argv)
     }
 
     double t0 = now_secs();
+    int first_nonzero_frame = -1;
+    static uint16_t fb[256 * 224];
     for (int i = 0; i < frames; ++i) {
         r = snes_run_frame();
         if (r != SNES_OK) { fprintf(stderr, "snes_run_frame[%d]: %d\n", i, r); break; }
+        if (first_nonzero_frame < 0 && (i & 0x1f) == 0) {
+            snes_get_framebuffer(fb);
+            for (int p = 0; p < 256 * 224; p++) {
+                if (fb[p]) { first_nonzero_frame = i; break; }
+            }
+        }
     }
     double t1 = now_secs();
+    if (first_nonzero_frame >= 0)
+        printf("first non-zero frame: %d\n", first_nonzero_frame);
+    else
+        printf("frame buffer stayed all-zero for entire bench\n");
 
     double secs = t1 - t0;
     double fps  = (secs > 0.0) ? (double)frames / secs : 0.0;

@@ -28,83 +28,46 @@ add_compile_options(
 )
 
 # ----------------------------------------------------------------------
-# Vendored snes9x2002 (snes9x non-commercial license — see vendor/VENDORING.md)
-# Source list and defines mirror vendor/snes9x2002/Makefile.common non-ARM_ASM path.
+# Vendored LakeSnes (MIT — see vendor/lakesnes/LICENSE.txt + VENDORING.md)
+# Pure-C SNES core, ~6,500 LOC, per-scanline rendering native (the
+# essential property snes9x2002 was missing). Patches over upstream:
+#   - ppu.h: pixelBuffer shrunk from 978 KB → 2 KB (single line) +
+#            scanlineCb hook, see vendor/VENDORING.md.
+#   - cart.c / snes_other.c: zero-copy XIP path under thumbysnes_cart_xip.
 # ----------------------------------------------------------------------
-set(S9X_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/snes9x2002)
-set(S9X_SRC ${S9X_DIR}/src)
-set(S9X_RET ${S9X_DIR}/libretro)
-set(S9X_COMMON ${S9X_RET}/libretro-common)
+set(LK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/lakesnes)
+set(LK_SRC ${LK_DIR}/snes)
 
-if(EXISTS ${S9X_SRC}/cpu.c)
-    set(SNES9X2002_CORE_SRC
-        ${S9X_SRC}/apu.c
-        ${S9X_SRC}/apuaux.c
-        ${S9X_SRC}/c4.c
-        ${S9X_SRC}/c4emu.c
-        # cheats.c / cheats2.c removed — 302 KB static `Cheat` array.
-        # Stubs for S9xInitCheatData / S9xApplyCheats live in snes_core.c
-        # (referenced from memmap.c, gfx.c, gfx16.c).
-        ${S9X_SRC}/clip.c
-        ${S9X_SRC}/data.c
-        ${S9X_SRC}/dsp1.c
-        ${S9X_SRC}/fxemu.c
-        ${S9X_SRC}/fxinst.c
-        ${S9X_SRC}/globals.c
-        ${S9X_SRC}/dma.c
-        ${S9X_SRC}/memmap.c
-        ${S9X_SRC}/cpu.c
-        ${S9X_SRC}/cpuexec.c
-        ${S9X_SRC}/cpuops.c
-        # sa1.c / sa1cpu.c removed — Super FX / SA-1 chips out of scope.
-        # Stub for S9xSA1MainLoop lives in snes_core.c; SA-1 struct stays
-        # in globals.c (memmap.c still reads SA1_Map during mapper setup)
-        # but SA1.Executing stays FALSE so the loop is never entered.
-        # Saves ~80 KB text (flash) — SRAM impact is minor.
-        ${S9X_SRC}/sdd1.c
-        ${S9X_SRC}/sdd1emu.c
-        ${S9X_SRC}/snapshot.c
-        ${S9X_SRC}/soundux.c
-        ${S9X_SRC}/spc700.c
-        ${S9X_SRC}/srtc.c
-        # non-ARM_ASM raster path
-        ${S9X_SRC}/ppu_.c
-        ${S9X_SRC}/gfx.c
-        ${S9X_SRC}/tile.c
-        # libretro-common memory stream (used by the core's STREAM macros)
-        ${S9X_COMMON}/streams/memory_stream.c
+if(EXISTS ${LK_SRC}/snes.h)
+    set(LAKESNES_CORE_SRC
+        ${LK_SRC}/apu.c
+        ${LK_SRC}/cart.c
+        ${LK_SRC}/cpu.c
+        ${LK_SRC}/dma.c
+        ${LK_SRC}/dsp.c
+        ${LK_SRC}/input.c
+        ${LK_SRC}/ppu.c
+        ${LK_SRC}/snes.c
+        ${LK_SRC}/snes_other.c
+        ${LK_SRC}/spc.c
+        ${LK_SRC}/statehandler.c
     )
 
-    add_library(snes9x2002 STATIC ${SNES9X2002_CORE_SRC})
-    target_include_directories(snes9x2002 PUBLIC
-        ${S9X_SRC}
-        ${S9X_RET}
-        ${S9X_COMMON}/include
-    )
-    target_compile_definitions(snes9x2002 PUBLIC
-        __LIBRETRO__
-        HAVE_STDINT_H
-        HAVE_INTTYPES_H
-        HAVE_STRINGS_H
-        USE_SA1
-        __OLD_RASTER_FX__
-    )
-    target_compile_options(snes9x2002 PRIVATE
+    add_library(lakesnes STATIC ${LAKESNES_CORE_SRC})
+    target_include_directories(lakesnes PUBLIC ${LK_SRC})
+    target_compile_options(lakesnes PRIVATE
         -O3
-        -fomit-frame-pointer
-        -ffast-math
+        -fno-omit-frame-pointer
         -fstrict-aliasing
-        # Per-function / per-data sections so the linker can dead-strip
-        # unused globals (e.g. the 302 KB `Cheat` struct in globals.c
-        # once cheats.c/cheats2.c are out of the build).
         -ffunction-sections
         -fdata-sections
+        -Wno-unused-parameter
+        -Wno-unused-but-set-variable
     )
-    set(SNES9X2002_PRESENT TRUE)
+    set(LAKESNES_PRESENT TRUE)
 else()
-    message(WARNING "ThumbySNES: vendor/snes9x2002 not present — skipping emulator lib. "
-                    "See PLAN.md §10 for the Phase 0 vendor steps.")
-    set(SNES9X2002_PRESENT FALSE)
+    message(WARNING "ThumbySNES: vendor/lakesnes not present — skipping emulator lib.")
+    set(LAKESNES_PRESENT FALSE)
 endif()
 
 # ----------------------------------------------------------------------
@@ -112,8 +75,8 @@ endif()
 # ----------------------------------------------------------------------
 add_library(thumbysnes STATIC src/snes_core.c)
 target_include_directories(thumbysnes PUBLIC src)
-if(SNES9X2002_PRESENT)
-    target_link_libraries(thumbysnes PUBLIC snes9x2002 m)
+if(LAKESNES_PRESENT)
+    target_link_libraries(thumbysnes PUBLIC lakesnes m)
     target_compile_definitions(thumbysnes PRIVATE THUMBYSNES_HAVE_CORE=1)
 endif()
 
@@ -129,7 +92,7 @@ target_link_options(snesbench PRIVATE -Wl,--gc-sections)
 # to track live heap + peak watermark across load + N frames per ROM.
 # Only the audit target gets the wrap; snesbench/sneshost stay clean.
 # ----------------------------------------------------------------------
-if(SNES9X2002_PRESENT)
+if(LAKESNES_PRESENT)
     add_executable(memaudit src/snes_memaudit_main.c)
     target_link_libraries(memaudit PRIVATE thumbysnes)
     target_link_options(memaudit PRIVATE

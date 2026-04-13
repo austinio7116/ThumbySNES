@@ -85,8 +85,10 @@ static int boot_filesystem(void) {
 
 int main(void) {
     /* Clock BEFORE stdio_init so the USB PLL comes up at the right
-     * divider. snes9x2002 wants 250 MHz for later phases. */
-    set_sys_clock_khz(250000, true);
+     * divider. SNES emulation is CPU-bound — bump from 250 to 300 MHz
+     * for a free 20% on the inner loop. RP2350 spec is 150 MHz nominal
+     * but the silicon happily runs at 300+ MHz with stock voltage. */
+    set_sys_clock_khz(300000, true);
     stdio_init_all();
 
     snes_buttons_init();

@@ -52,11 +52,53 @@ snes_result_t snes_load_xip(const uint8_t *rom, size_t rom_len);
 /* Run one SNES frame (~4.17M master cycles). */
 snes_result_t snes_run_frame(void);
 
-/* Software reset — keeps loaded ROM. */
-void snes_reset(void);
-
 /* Release all state. Safe to call without a prior load. */
 void snes_unload(void);
+
+/* Performance toggle — when on, the PPU skips colour math (subscreen
+ * fetch + add/sub blending). Loses SNES transparency / fade effects
+ * but cuts per-pixel work nearly in half. Off by default. */
+void snes_set_skip_color_math(int enable);
+
+/* Per-line PPU render window. SNES renders 256 pixels per scanline
+ * by default; FILL display mode crops to 224 (16 px each side), so
+ * setting (16, 240) skips ~12.5% of the per-pixel work. Default is
+ * the full SNES width (0, 256). */
+void snes_set_render_x_range(int x_start, int x_end);
+
+/* Install a per-scanline output callback (LakeSnes core hooks this
+ * via ppu_setScanlineCallback). `cb(user, line, line_buffer)` fires
+ * after each visible scanline; `line_buffer` is 256 px × 8 B in BGRX
+ * format. The default callback assembles a 256x224 RGB565 frame for
+ * snes_get_framebuffer; install your own for direct LCD-blit paths. */
+void snes_set_scanline_cb(void (*cb)(void *user, int line, const uint8_t *line_buffer),
+                          void *user);
+
+/* Diagnostic peeks into the live core. Safe to call any time after
+ * snes_load*. Returns 0 if no core loaded. */
+uint16_t snes_dbg_pc(void);          /* CPU program counter (16-bit, in current PB) */
+uint8_t  snes_dbg_pb(void);          /* CPU program bank */
+uint16_t snes_dbg_a(void);
+uint8_t  snes_dbg_brightness(void);  /* PPU brightness $2100 low nibble (0..15) */
+uint8_t  snes_dbg_forced_blank(void);/* 1 if PPU is in forced blank */
+uint8_t  snes_dbg_wram(uint32_t addr); /* WRAM byte at addr (& 0x1FFFF) */
+
+/* APU outPorts[0..3] — the SPC700 → CPU mailbox bytes the game reads
+ * at $2140-$2143. After IPL boot they should be 0xAA, 0xBB, 0x??, 0x??.
+ * If they stay 0, SPC isn't running. */
+uint8_t  snes_dbg_apu_out(int idx);
+
+/* APU cycles run since reset — proves SPC is actually executing. */
+uint32_t snes_dbg_apu_cycles(void);
+
+/* Peek into the cart ROM buffer as the LoROM mapper sees it.
+ * For PC=00:8090 this returns the byte at ROM offset 0x90. */
+uint8_t  snes_dbg_rom_byte_lorom(uint32_t bank, uint16_t addr);
+
+/* SPC700 program counter + in-port byte 0. Tells us whether the
+ * SPC is actually executing and what value CPU last sent it. */
+uint16_t snes_dbg_spc_pc(void);
+uint8_t  snes_dbg_apu_in(int idx);
 
 /*
  * Copy the current 256x224 PPU output as RGB565 into `dst`.

@@ -1,0 +1,20 @@
+# System files
+.DS_Store
+# Executables
+elzsnes
+lakesnes
+lakesnes_*
+lakesnes.*
+LakeSnes.app
+# Created files
+dump.bin
+# sdl2 directory
+sdl2
+# Build results/libraries
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.res
+*.dSYM
