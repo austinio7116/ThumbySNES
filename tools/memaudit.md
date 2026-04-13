@@ -229,11 +229,9 @@ Further cuts if needed:
 - Reduce Echo further (shrink to 8192 → -32 KB with audible artifacts).
 - Move Echo + DSP tables + other large const LUTs explicitly to flash.
 
-**Honest verdict**: fitting in 390 KB requires both Phase 2 surgeries (done)
-AND Phase 4+ tile-cache eviction AND probably one more knob
-(transparency off OR color math off OR echo clipped). We won't know
-whether we need the third knob until Phase 5 profiling on device — let
-it be driven by real measurements, not speculation.
+**Initial Phase 2 verdict**: fitting in 390 KB requires both Phase 2
+surgeries (done) AND Phase 4+ tile-cache eviction AND probably one more
+knob. Phase 4 measurements below show the gap is wider than that.
 
 ---
 
@@ -311,4 +309,123 @@ Net: **fitting in 390 KB is still possible but requires ~185 KB more**,
 which means closing transparency and/or shrinking memory map. Both are
 surgical changes that can happen in Phase 4 alongside the scanline
 render. Still feasible, still tight, no comfortable margin.
+
+---
+
+## Phase 4 device-build measurements (2026-04-13)
+
+Built `firmware/snesrun_device.uf2` with `THUMBYSNES_LINK_CORE=ON`,
+all Phase 2 surgeries + tile eviction + new device-only flags:
+`THUMBYSNES_FLASH_GFX_ZERO=1` (LUT to flash) and
+`THUMBYSNES_DISABLE_TRANSPARENCY=1` (alias SubScreen onto Screen,
+SubZBuffer onto ZBuffer, force `Settings.Transparency = FALSE`).
+
+`arm-none-eabi-size build_device/snesrun_device.elf`:
+
+| Section | Bytes | Note |
+|---|---:|---|
+| text   | 742,000 | Flash-resident — fine, 16 MB available |
+| data   |       0 | |
+| **bss** | **333,628** | **64% of 520 KB SRAM total** |
+
+The big BSS contributors (from `nm --size-sort`):
+
+| Symbol | KB | Note |
+|---|---:|---|
+| Echo | 64 | snes9x SPC echo delay buffer |
+| Memory (struct) | 56 | Memory map tables — already halved on 32-bit |
+| cache (snes_flash_disk) | 16 | Already shrunk 8→4 blocks |
+| g_fb (LCD framebuffer) | 32 | Mandatory for SPI flush |
+| buffer (DMA) | 16 | Already shrunk |
+| SA1_Map + SA1_WriteMap | 32 | Dead code — still BSS-resident |
+| DSP1 sin/cos tables | 32 | 4× 8 KB float arrays |
+| DirectColourMaps | 8 | |
+| Sound buffers (Mix/Echo/Dummy) | 21 | SOUND_BUFFER_SIZE-derived |
+| IPPU + GSU + LineData + LineMatrixData | ~13 | Core PPU state |
+| g_roms (picker) | 6.5 | Per-ROM metadata cache |
+| favs_buf (picker) | 4 | Favorites store |
+| (rest) | ~33 | small stuff |
+
+SRAM math: 520 KB total - 333 KB BSS - ~50 KB stack/firmware overhead =
+**~137 KB heap available**.
+
+### Heap demand vs supply
+
+The mandatory SNES state alone exceeds the heap budget on its own:
+
+| Heap alloc | KB | Status |
+|---|---:|---|
+| Memory.RAM (WRAM) | 128 | mandatory |
+| Memory.SRAM (capped) | 64 | mandatory |
+| Memory.VRAM | 64 | mandatory |
+| IAPU.RAM (ARAM) | 64 | mandatory |
+| **Mandatory subtotal** | **320** | |
+| FillRAM (XIP I/O shadow) | 32 | XIP-only |
+| Tile caches (hash-evicted) | 72 | shrunk Phase 4 prep |
+| GFX.Screen (Sub aliased) | 150 | SubScreen no longer separate |
+| GFX.ZBuffer (SubZ aliased) | 75 | SubZBuffer no longer separate |
+| (other small core allocs) | ~30 | |
+| **Total demand** | **~679 KB** | |
+
+Heap supply: **~137 KB**. Demand: **~679 KB**. **Gap: ~540 KB.**
+
+### Honest conclusion
+
+**A standard snes9x2002 emulator does not fit in stock Thumby Color SRAM
+(520 KB).** Even after every shrink applied (cheats out, SA-1 out, SDD1
+shrunk, Echo at 16 K samples, tile cache hash-evicted to 72 KB, GFX
+buffers shrunk 11 MB → 225 KB, GFX.ZERO LUT to flash, SubScreen+SubZ
+aliased), the mandatory SNES state (128+64+64+64 KB = 320 KB of WRAM /
+VRAM / ARAM / SRAM) **alone exceeds the available heap (~137 KB) by
+~180 KB**.
+
+The remaining gap (540 KB) breaks down as:
+- ~180 KB of mandatory SNES state can't fit in heap because BSS already
+  consumed most of SRAM.
+- ~225 KB of GFX buffers (Screen + ZBuffer) — needs per-scanline render
+  surgery to shrink to ~3 KB.
+- ~135 KB of other heap (FillRAM, tile caches, misc).
+
+### What would close the gap?
+
+1. **Convert mandatory SNES state from heap to fixed BSS.** Same total
+   bytes, but moving Memory.RAM/.SRAM/.VRAM/IAPU.RAM out of malloc and
+   into static arrays would cancel the 320 KB heap demand at the cost of
+   320 KB more BSS — net zero, but means we're not blocked by heap
+   exhaustion. Linker would catch the over-budget condition at build time
+   instead of at runtime.
+
+2. **Per-scanline GFX rendering.** Patch `ppu_.c` so it writes one line
+   at a time into a small bounce buffer, immediately blitted to the LCD
+   framebuffer + reused for the next line. Saves ~225 KB. Significant
+   surgery — the existing `RenderScreen` accumulates many lines in a
+   single call across HDMA clip ranges.
+
+3. **Drop more BSS to flash.** DSP1 tables (32 KB) + DirectColourMaps
+   (8 KB if PPU.Brightness is held fixed) → flash-const generators.
+   Echo `int[16384]` → `int16[16384]` (-32 KB). SA1_Map/WriteMap remove
+   (requires patching memmap.c to stop indexing into them in mapper
+   setup, ~64 KB save).
+
+Even ALL of (1)+(2)+(3) leaves us ~50 KB tight against 520 KB. Workable
+but no margin.
+
+### Strategic options
+
+The fundamental constraint is `320 KB mandatory SNES state` + `333 KB
+BSS` = 653 KB > 520 KB SRAM **before counting any GFX buffers, stack,
+or firmware overhead**. The Thumby Color hardware as shipped is at the
+ragged edge of feasibility for a snes9x-class emulator.
+
+Three paths forward:
+
+| Path | Effort | Outcome |
+|---|---|---|
+| **A. Push through with all surgeries** | High (per-scanline renderer + BSS-to-flash for DSP1 + heap-to-BSS for SNES state + remove SA-1 references in memmap.c) | Tight fit, no margin. Some games will OOM under heavy scenes. CPU perf untested. |
+| **B. PSRAM-equipped board** (Pico Plus 2 = 8 MB PSRAM, ~$10) | Low (CMake board override + a bit of memory-mapping for WRAM/SRAM/ARAM in PSRAM). Stays code-compatible with stock Thumby Color where it fits. | Memory solved cleanly. Still need CPU work. NOT stock Thumby Color. |
+| **C. Smaller SNES core** (search for a scaled-down core) | Medium (vendor + integrate a different emulator). Risk: smaller cores tend to be incomplete. | Probably possible to fit, lower compatibility ceiling. |
+
+User decision needed: **proceed with A**, **pivot to B**, or **investigate
+C**? Phase 4 work to date is committed; whichever path we take, Phases
+0-3 + the cache eviction + GFX shrink groundwork remain useful.
 

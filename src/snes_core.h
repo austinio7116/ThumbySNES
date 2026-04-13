@@ -29,10 +29,25 @@ typedef enum {
 
 /*
  * Load a ROM image from a contiguous memory region. The buffer MUST remain
- * live for the lifetime of the emulator session — on device we pass the
- * XIP-mapped flash address of the FatFs file and never copy.
+ * live for the lifetime of the emulator session. This path allocates a 6 MB
+ * internal ROM buffer inside snes9x2002 and memcpy's the ROM into it —
+ * fine on host; don't use on device.
  */
 snes_result_t snes_load(const uint8_t *rom, size_t rom_len);
+
+/*
+ * XIP / zero-copy load: the core's Memory.ROM pointer is set directly to
+ * `rom` (no 6 MB malloc, no copy). Caller MUST guarantee:
+ *   - `rom` is readable for at least `rom_len` bytes, and remains valid
+ *     for the lifetime of the emulator session (typically XIP flash on
+ *     the Thumby Color).
+ *   - The ROM has no 512-byte header (*.sfc or headerless *.smc).
+ *   - The ROM is not one of the special cases that triggers a ROM-rewrite
+ *     inside LoadROM (DAIKAIJYUMONOGATARI2, WWF SUPER WRESTLEMANIA,
+ *     interleaved ROMs like Tales/Star Ocean, ExHiROM > 4 MB). These will
+ *     fault when the core tries to memmove into read-only flash.
+ */
+snes_result_t snes_load_xip(const uint8_t *rom, size_t rom_len);
 
 /* Run one SNES frame (~4.17M master cycles). */
 snes_result_t snes_run_frame(void);

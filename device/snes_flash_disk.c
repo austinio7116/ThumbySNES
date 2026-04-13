@@ -39,7 +39,11 @@
  * directly to the malloc heap. That extra room is the difference
  * between delunky (97 KB cart bytes + 192 KB Lua heap cap = 289 KB
  * out of ~291 KB free) tipping over and fitting comfortably. */
-#define CACHE_BLOCKS 8
+/* ThumbySNES: 8 → 4 blocks (4 KB each → 16 KB BSS, was 32 KB).  Cache
+ * is exercised during USB-MSC write bursts; once the emulator is
+ * running it's idle. Fewer slots = slightly more flush churn during
+ * ROM drops, negligible user-visible cost. */
+#define CACHE_BLOCKS 4
 
 typedef struct {
     int32_t  block;     /* erase-block index, -1 = empty slot */

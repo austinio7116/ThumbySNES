@@ -477,10 +477,19 @@ bool8_32 S9xGraphicsInit(void)
    }
 #endif
 #else
+#ifdef THUMBYSNES_FLASH_GFX_ZERO
+   /* ThumbySNES: point GFX.ZERO at the flash-resident LUT generated
+    * by tools/gen_gfx_zero.c. Saves 128 KB of SRAM vs the malloc +
+    * runtime-fill path below. */
+   extern const uint16_t thumbysnes_gfx_zero[0x10000];
+   GFX.ZERO = (uint16_t *) thumbysnes_gfx_zero;
+#else
    if (!(GFX.ZERO = (uint16_t*) malloc(sizeof(uint16_t) * 0x10000)))
       return false;
 #endif
+#endif
 
+#ifndef THUMBYSNES_FLASH_GFX_ZERO
    // Build a lookup table that if the top bit of the color value is zero
    // then the value is zero, otherwise its just the value.
    for (r = 0; r <= MAX_RED; r++)
@@ -511,6 +520,7 @@ bool8_32 S9xGraphicsInit(void)
          }
       }
    }
+#endif
 
    return (TRUE);
 }
@@ -533,7 +543,11 @@ void S9xGraphicsDeinit(void)
 #endif
    if (GFX.ZERO)
    {
+#ifndef THUMBYSNES_FLASH_GFX_ZERO
+      /* With THUMBYSNES_FLASH_GFX_ZERO, GFX.ZERO points at flash .rodata
+       * (see gen_gfx_zero.c) — don't free a const pointer. */
       free((char*) GFX.ZERO);
+#endif
       GFX.ZERO = NULL;
    }
 }

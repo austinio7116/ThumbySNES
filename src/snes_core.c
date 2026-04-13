@@ -87,25 +87,68 @@ static void snes_init_settings(void)
     CPU.Flags = 0;
 }
 
-static void snes_init_gfx_buffers(void)
+static int snes_init_gfx_buffers(void)
 {
-    const int safety = 128;
-    GFX.Pitch = 2048;
+    /* Screen / ZBuffer are uint16 / uint8 per pixel at stride GFX_PITCH
+     * (640 B) / GFX_ZPITCH (320 B). Upstream libretro allocs Screen at
+     * 4 MB, sized for hires (512 px) × double-height HDMA latching.
+     * With SupportHiRes = FALSE the actual footprint is just
+     * GFX_PITCH × 240 for Screen and half that for Z.
+     *
+     * SubScreen / SubZBuffer only get written when Settings.Transparency
+     * is TRUE (gfx.c:3017 onward). Device disables that and aliases them
+     * on top of Screen / ZBuffer — GFX.Delta goes to 0 (SubScreen and
+     * Screen point at the same bytes). Visual loss: SNES colour-math
+     * effects (HUD fades, Mode-7 color mixing, Zelda lantern glow) —
+     * acceptable per PLAN.md §9. Saves 225 KB SRAM on device. */
+    const int safety       = 128;
+    const int screen_rows  = 240;
+    const int screen_pitch = 640;
+    const int screen_bytes = screen_pitch * screen_rows;      /* 150 KB */
+    const int z_pitch      = 320;
+    const int z_bytes      = z_pitch * screen_rows;           /*  75 KB */
 
-    s_gfx_screen_buffer = (uint8_t *)calloc(1, 2048 * 512 * 2 * 2 + safety);
+    GFX.Pitch = screen_pitch;
+
+#ifdef THUMBYSNES_DISABLE_TRANSPARENCY
+    /* Shared-buffer mode: SubScreen shares Screen, SubZBuffer shares
+     * ZBuffer. Only valid when Settings.Transparency stays FALSE. */
+    s_gfx_screen_buffer = (uint8_t *)calloc(1, screen_bytes + safety);
+    if (!s_gfx_screen_buffer) return 0;
     GFX.Screen_buffer = s_gfx_screen_buffer;
-    GFX.Screen = s_gfx_screen_buffer + safety;
-    GFX.SubScreen = GFX.Screen + 2048 * 512 * 2;
+    GFX.Screen        = s_gfx_screen_buffer + safety;
+    GFX.SubScreen     = GFX.Screen;             /* aliased */
 
-    s_gfx_zbuffer_buffer = (uint8_t *)calloc(1, GFX.Pitch * 512 * sizeof(uint16) + safety);
+    s_gfx_zbuffer_buffer = (uint8_t *)calloc(1, z_bytes + safety);
+    if (!s_gfx_zbuffer_buffer) return 0;
+    GFX.ZBuffer_buffer   = s_gfx_zbuffer_buffer;
+    GFX.ZBuffer          = s_gfx_zbuffer_buffer + safety;
+    GFX.SubZBuffer       = GFX.ZBuffer;         /* aliased */
+    s_gfx_subzbuffer_buffer = NULL;             /* not allocated */
+    GFX.SubZBuffer_buffer = NULL;
+
+    GFX.Delta = 0;
+    Settings.Transparency = FALSE;              /* double-belt */
+#else
+    s_gfx_screen_buffer = (uint8_t *)calloc(1, screen_bytes * 2 + safety);
+    if (!s_gfx_screen_buffer) return 0;
+    GFX.Screen_buffer = s_gfx_screen_buffer;
+    GFX.Screen        = s_gfx_screen_buffer + safety;
+    GFX.SubScreen     = GFX.Screen + screen_bytes;
+
+    s_gfx_zbuffer_buffer = (uint8_t *)calloc(1, z_bytes + safety);
+    if (!s_gfx_zbuffer_buffer) return 0;
     GFX.ZBuffer_buffer = s_gfx_zbuffer_buffer;
-    GFX.ZBuffer = s_gfx_zbuffer_buffer + safety;
+    GFX.ZBuffer        = s_gfx_zbuffer_buffer + safety;
 
-    s_gfx_subzbuffer_buffer = (uint8_t *)calloc(1, GFX.Pitch * 512 * sizeof(uint16) + safety);
+    s_gfx_subzbuffer_buffer = (uint8_t *)calloc(1, z_bytes + safety);
+    if (!s_gfx_subzbuffer_buffer) return 0;
     GFX.SubZBuffer_buffer = s_gfx_subzbuffer_buffer;
-    GFX.SubZBuffer = s_gfx_subzbuffer_buffer + safety;
+    GFX.SubZBuffer        = s_gfx_subzbuffer_buffer + safety;
 
-    GFX.Delta = 1048576; /* (SubScreen - Screen) >> 1 */
+    GFX.Delta = screen_bytes >> 1;
+#endif
+    return 1;
 }
 
 static int snes_emu_init(void)
@@ -122,22 +165,49 @@ static int snes_emu_init(void)
     if (!S9xInitSound() || !S9xGraphicsInit()) {
         return 0;
     }
-    snes_init_gfx_buffers();
+    if (!snes_init_gfx_buffers()) {
+        return 0;
+    }
     s_inited = 1;
     return 1;
 }
 
-snes_result_t snes_load(const uint8_t *rom, size_t rom_len)
+/* Thumbysnes XIP hooks exposed from vendor/snes9x2002/src/memmap.c — set
+ * BEFORE MemoryInit() fires inside snes_emu_init(). */
+extern uint8         thumbysnes_rom_is_xip;
+extern const uint8_t *thumbysnes_xip_rom;
+extern size_t        thumbysnes_xip_rom_size;
+
+static snes_result_t snes_load_common(const uint8_t *rom, size_t rom_len, int xip)
 {
     if (!rom || rom_len < 0x8000) {
         return SNES_ERR_BAD_ROM;
     }
+
+    /* Must set XIP hooks before MemoryInit runs so it can skip the 6 MB
+     * Memory.ROM malloc and point directly at flash. */
+    if (xip) {
+        thumbysnes_rom_is_xip   = 1;
+        thumbysnes_xip_rom      = rom;
+        thumbysnes_xip_rom_size = rom_len;
+        /* Force ForceNoHeader so LoadROM's header-strip memmove never
+         * runs against the read-only XIP buffer. */
+    } else {
+        thumbysnes_rom_is_xip   = 0;
+        thumbysnes_xip_rom      = NULL;
+        thumbysnes_xip_rom_size = 0;
+    }
+
     if (!snes_emu_init()) {
         return SNES_ERR_OOM;
     }
 
-    /* Core's memstream-backed LoadROM() reads from this buffer instead of fopen. */
-    memstream_set_buffer((uint8_t *)rom, rom_len);
+    if (xip) {
+        Settings.ForceNoHeader = TRUE;
+    } else {
+        /* Core's memstream-backed LoadROM() reads from this buffer. */
+        memstream_set_buffer((uint8_t *)rom, rom_len);
+    }
 
     if (!LoadROM()) {
         return SNES_ERR_BAD_ROM;
@@ -152,6 +222,16 @@ snes_result_t snes_load(const uint8_t *rom, size_t rom_len)
 
     s_loaded = 1;
     return SNES_OK;
+}
+
+snes_result_t snes_load(const uint8_t *rom, size_t rom_len)
+{
+    return snes_load_common(rom, rom_len, /*xip=*/0);
+}
+
+snes_result_t snes_load_xip(const uint8_t *rom, size_t rom_len)
+{
+    return snes_load_common(rom, rom_len, /*xip=*/1);
 }
 
 snes_result_t snes_run_frame(void)

@@ -157,7 +157,9 @@ static int run_rom(const char *path, int frames)
     g_enabled = 1;
     size_t before_load = 0;
 
-    snes_result_t r = snes_load(rom, st.st_size);
+    extern int g_audit_xip; /* set in main */
+    snes_result_t r = g_audit_xip ? snes_load_xip(rom, st.st_size)
+                                  : snes_load    (rom, st.st_size);
     if (r != SNES_OK) {
         fprintf(stderr, "  snes_load failed: %d\n", r);
         munmap((void *)rom, st.st_size);
@@ -205,6 +207,8 @@ static int str_cmp_fwd(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+int g_audit_xip = 0;
+
 int main(int argc, char **argv)
 {
     int frames = 120;
@@ -214,6 +218,7 @@ int main(int argc, char **argv)
         long n = strtol(argv[1], &end, 10);
         if (*end == '\0') { frames = (int)n; first_rom = 2; }
     }
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--xip")) g_audit_xip = 1;
 
     size_t global_peak = 0;
     const char *peak_rom = "";

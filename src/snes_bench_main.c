@@ -28,11 +28,13 @@ static double now_secs(void)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <rom.smc> [frames=600]\n", argv[0]);
+        fprintf(stderr, "usage: %s <rom.smc> [frames=600] [--xip]\n", argv[0]);
         return 1;
     }
     const char *path = argv[1];
     int frames = (argc >= 3) ? atoi(argv[2]) : 600;
+    int use_xip = 0;
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--xip")) use_xip = 1;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
@@ -42,7 +44,7 @@ int main(int argc, char **argv)
     const uint8_t *rom = mmap(NULL, rom_len, PROT_READ, MAP_PRIVATE, fd, 0);
     if (rom == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
 
-    snes_result_t r = snes_load(rom, rom_len);
+    snes_result_t r = use_xip ? snes_load_xip(rom, rom_len) : snes_load(rom, rom_len);
     if (r != SNES_OK) {
         fprintf(stderr, "snes_load: %d (stub until Phase 0 core vendor — see PLAN.md §10)\n", r);
         munmap((void*)rom, rom_len);

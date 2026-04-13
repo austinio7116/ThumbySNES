@@ -38,6 +38,25 @@ if(THUMBYSNES_LINK_CORE)
     set(S9X_SRC    ${S9X_DIR}/src)
     set(S9X_COMMON ${S9X_DIR}/libretro/libretro-common)
 
+    # Build-time generator: emits gfx_zero_table.c embedding the 128 KB
+    # RGB565 colour-math LUT as a const array. Compiled into the core
+    # as read-only flash data — removes the matching 128 KB heap alloc
+    # snes9x2002's S9xGraphicsInit does by default.
+    set(GFX_ZERO_TBL ${CMAKE_CURRENT_BINARY_DIR}/gfx_zero_table.c)
+    set(GFX_ZERO_GEN ${CMAKE_CURRENT_BINARY_DIR}/gen_gfx_zero)
+    add_custom_command(
+        OUTPUT  ${GFX_ZERO_GEN}
+        COMMAND cc -O2 -o ${GFX_ZERO_GEN} ${SNES_ROOT}/tools/gen_gfx_zero.c
+        DEPENDS ${SNES_ROOT}/tools/gen_gfx_zero.c
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT  ${GFX_ZERO_TBL}
+        COMMAND ${GFX_ZERO_GEN} ${GFX_ZERO_TBL}
+        DEPENDS ${GFX_ZERO_GEN}
+        VERBATIM
+    )
+
     set(SNES9X2002_CORE_SRC
         ${S9X_SRC}/apu.c          ${S9X_SRC}/apuaux.c
         ${S9X_SRC}/c4.c           ${S9X_SRC}/c4emu.c
@@ -54,6 +73,7 @@ if(THUMBYSNES_LINK_CORE)
         ${S9X_SRC}/tile.c
         ${S9X_COMMON}/streams/memory_stream.c
         ${SNES_ROOT}/src/snes_core.c
+        ${GFX_ZERO_TBL}
     )
 
     add_library(snes9x2002_dev STATIC ${SNES9X2002_CORE_SRC})
@@ -71,6 +91,13 @@ if(THUMBYSNES_LINK_CORE)
         USE_SA1
         __OLD_RASTER_FX__
         THUMBYSNES_HAVE_CORE=1
+        # Point GFX.ZERO at the flash-resident LUT (gfx_zero_table.c)
+        # instead of malloc + runtime compute — saves 128 KB SRAM.
+        THUMBYSNES_FLASH_GFX_ZERO=1
+        # Alias SubScreen onto Screen + force Settings.Transparency=FALSE.
+        # Loses SNES colour-math effects (HUD fades, transparency). Saves
+        # ~225 KB SRAM. See snes_init_gfx_buffers in snes_core.c.
+        THUMBYSNES_DISABLE_TRANSPARENCY=1
         # Place hot loops in SRAM for flash-XIP cache-miss avoidance.
         # Device-only — on host builds this expands to nothing.
         "IRAM_ATTR=__attribute__((section(\".time_critical.snes\")))"

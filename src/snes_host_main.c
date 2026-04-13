@@ -187,12 +187,14 @@ int main(int argc, char **argv)
         return 1;
     }
     int start_mode = MODE_FILL;
+    int use_xip    = 0;
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i], "--fill")) start_mode = MODE_FILL;
         else if (!strcmp(argv[i], "--fit"))  start_mode = MODE_FIT;
         else if (!strcmp(argv[i], "--full")) start_mode = MODE_FULL;
         /* legacy alias */
         else if (!strcmp(argv[i], "--thumby")) start_mode = MODE_FIT;
+        else if (!strcmp(argv[i], "--xip"))    use_xip = 1;
     }
 
     int fd = open(argv[1], O_RDONLY);
@@ -202,7 +204,8 @@ int main(int argc, char **argv)
     const uint8_t *rom = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (rom == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
 
-    snes_result_t r = snes_load(rom, st.st_size);
+    snes_result_t r = use_xip ? snes_load_xip(rom, st.st_size)
+                              : snes_load    (rom, st.st_size);
     if (r != SNES_OK) {
         fprintf(stderr, "snes_load: %d\n", r);
     }

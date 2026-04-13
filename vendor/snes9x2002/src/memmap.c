@@ -169,6 +169,16 @@ static char *Safe (const char *s)
 /* Init()                                                                                     */
 /* This function allocates all the memory needed by the emulator                              */
 /**********************************************************************************************/
+/* ThumbySNES: when nonzero, Memory.ROM points at read-only XIP flash and
+ * every ROM-write path (header-strip memmove, trailing memset, DAIKAIJYU
+ * fixup, interleave deinterleave, ExHiROM shuffle) must be skipped. Set
+ * by snes_load_xip() BEFORE MemoryInit() is called. The flag also lets
+ * MemoryInit skip the 6 MB Memory.ROM malloc entirely — on device with
+ * a 390 KB SRAM budget, that's non-negotiable. */
+uint8 thumbysnes_rom_is_xip = 0;
+const uint8_t *thumbysnes_xip_rom = NULL;
+size_t thumbysnes_xip_rom_size = 0;
+
 bool8_32 MemoryInit ()
 {
     Memory.RAM	    = (uint8 *) malloc (0x20000);
@@ -177,8 +187,18 @@ bool8_32 MemoryInit ()
      * See tools/memaudit.md. */
     Memory.SRAM    = (uint8 *) malloc (0x10000);
     Memory.VRAM    = (uint8 *) malloc (0x10000);
-    Memory.ROM     = (uint8 *) malloc (MAX_ROM_SIZE + 0x200 + 0x8000);
-    Memory.FillRAM = NULL;
+    if (thumbysnes_rom_is_xip) {
+        /* Memory.ROM points at flash (read-only). FillRAM — the 32 KB
+         * I/O register shadow — cannot share the ROM region because it
+         * gets written; allocate it separately. The `Memory.ROM +=
+         * 0x8000` / `Memory.FillRAM = Memory.ROM` shuffle below is
+         * skipped in XIP mode. */
+        Memory.ROM     = (uint8 *)thumbysnes_xip_rom;
+        Memory.FillRAM = (uint8 *)calloc(1, 0x8000);
+    } else {
+        Memory.ROM     = (uint8 *) malloc (MAX_ROM_SIZE + 0x200 + 0x8000);
+        Memory.FillRAM = NULL; /* set below */
+    }
 
     IPPU.TileCache [TILE_2BIT] = (uint8 *) malloc (MAX_2BIT_TILES * 128);
     IPPU.TileCache [TILE_4BIT] = (uint8 *) malloc (MAX_4BIT_TILES * 128);
@@ -203,14 +223,17 @@ bool8_32 MemoryInit ()
 	return (FALSE);
     }
 	
-    // FillRAM uses first 32K of ROM image area, otherwise space just
-    // wasted. Might be read by the SuperFX code.
+    if (!thumbysnes_rom_is_xip) {
+        // FillRAM uses first 32K of ROM image area, otherwise space just
+        // wasted. Might be read by the SuperFX code.
+        Memory.FillRAM = Memory.ROM;
 
-    Memory.FillRAM = Memory.ROM;
-
-    // Add 0x8000 to ROM image pointer to stop SuperFX code accessing
-    // unallocated memory (can cause crash on some ports).
-    Memory.ROM += 0x8000;
+        // Add 0x8000 to ROM image pointer to stop SuperFX code accessing
+        // unallocated memory (can cause crash on some ports).
+        Memory.ROM += 0x8000;
+    }
+    /* XIP mode: Memory.ROM already points directly at the flash-mapped ROM
+     * and Memory.FillRAM is its own malloc — nothing to shift. */
 
     Memory.C4RAM    = Memory.ROM + 0x400000 + 8192 * 8;
     ROM    = Memory.ROM;
@@ -252,9 +275,15 @@ void MemoryDeinit ()
     }
     if (Memory.ROM)
     {
-	Memory.ROM -= 0x8000;
-	free ((char *) Memory.ROM);
-	Memory.ROM = NULL;
+        if (thumbysnes_rom_is_xip) {
+            /* XIP ROM lives in flash, not on our heap — don't free.
+             * The matching FillRAM alloc we free normally. */
+            if (Memory.FillRAM) { free(Memory.FillRAM); Memory.FillRAM = NULL; }
+        } else {
+            Memory.ROM -= 0x8000;
+            free ((char *) Memory.ROM);
+        }
+        Memory.ROM = NULL;
     }
 
     if (IPPU.TileCache [TILE_2BIT])
@@ -338,7 +367,12 @@ bool8_32 LoadROM (void)
 
    Memory.CalculatedSize = 0;
 again:
-   {
+   if (thumbysnes_rom_is_xip) {
+      /* ThumbySNES: ROM data is already mapped in XIP flash. Skip the
+       * READ_STREAM copy + header-strip memmove (callers guarantee
+       * headerless .smc/.sfc via Settings.ForceNoHeader). */
+      TotalFileSize = (int32)thumbysnes_xip_rom_size;
+   } else {
       int calc_size;
       uint8 *ptr;
 
@@ -366,18 +400,19 @@ again:
    hi_score = ScoreHiROM (FALSE);
    lo_score = ScoreLoROM (FALSE);
 
-   if (Memory.HeaderCount == 0 && !Settings.ForceNoHeader &&
+   if (!thumbysnes_rom_is_xip && Memory.HeaderCount == 0 && !Settings.ForceNoHeader &&
          ((hi_score > lo_score && ScoreHiROM (TRUE) > hi_score) ||
           (hi_score <= lo_score && ScoreLoROM (TRUE) > lo_score)))
    {
       memmove (Memory.ROM, Memory.ROM + 512, TotalFileSize - 512);
       TotalFileSize -= 512;
-      S9xMessage (S9X_INFO, S9X_HEADER_WARNING, 
+      S9xMessage (S9X_INFO, S9X_HEADER_WARNING,
             "Try specifying the -nhd command line option if the game doesn't work\n");
    }
 
    Memory.CalculatedSize = (TotalFileSize / 0x2000) * 0x2000;
-   memset (Memory.ROM + Memory.CalculatedSize, 0, MAX_ROM_SIZE - Memory.CalculatedSize);
+   if (!thumbysnes_rom_is_xip)
+       memset (Memory.ROM + Memory.CalculatedSize, 0, MAX_ROM_SIZE - Memory.CalculatedSize);
 
    // Check for altered DAIKAIJYUMONOGATARI2
 
