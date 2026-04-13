@@ -38,6 +38,10 @@
   - 4% `dsp_cycle` (audio mixing — runs even though we discard samples)
   - 3% `cpu_doOpcode` (65816 dispatcher itself is fast)
 
+*(See `PERF.md` for the full catalog of optimizations currently active,
+grouped by category. Summary table below is chronological / highest
+impact first.)*
+
 ### Optimizations applied (cumulative, in order of impact)
 
 | Change | Effect |
