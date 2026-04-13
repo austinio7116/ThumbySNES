@@ -1,0 +1,21 @@
+build/
+build_device/
+build_asan/
+*.o
+*.obj
+*.a
+*.elf
+*.uf2
+!firmware/*.uf2
+*.dis
+*.bin
+*.map
+.cache/
+compile_commands.json
+# vendored at Phase 0, not yet committed
+vendor/snes9x2002/
+
+# ROM collection — never commit copyrighted game images
+roms/
+*.smc
+*.sfc
