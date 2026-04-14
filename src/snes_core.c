@@ -73,20 +73,29 @@ static int        s_frame_ctr  = 0;
 static uint16_t   s_default_fb[256 * 224];
 #endif
 
-/* SNES button bit layout LakeSnes expects (from input.c). 0..11. */
+/* SNES controller serial protocol button order.
+ *
+ * input_read() in LakeSnes shifts currentState right, sending bit 0
+ * first. snes_doAutoJoypad maps bit 0 → portAutoRead[15] (B), bit 1 →
+ * portAutoRead[14] (Y), etc. So the button index for snes_setButtonState
+ * must match the SERIAL position, not the portAutoRead bit position.
+ *
+ * Previous code used portAutoRead bit positions (LK_BTN_A=7 etc.) which
+ * caused every button to map to the wrong SNES button — e.g. Thumby A
+ * registered as D-pad RIGHT. */
 enum {
-    LK_BTN_R     = 4,
-    LK_BTN_L     = 5,
-    LK_BTN_X     = 6,
-    LK_BTN_A     = 7,
-    LK_BTN_RIGHT = 8,
-    LK_BTN_LEFT  = 9,
-    LK_BTN_DOWN  = 10,
-    LK_BTN_UP    = 11,
-    LK_BTN_START = 12,
-    LK_BTN_SELECT= 13,
-    LK_BTN_Y     = 14,
-    LK_BTN_B     = 15,
+    LK_BTN_B      = 0,
+    LK_BTN_Y      = 1,
+    LK_BTN_SELECT = 2,
+    LK_BTN_START  = 3,
+    LK_BTN_UP     = 4,
+    LK_BTN_DOWN   = 5,
+    LK_BTN_LEFT   = 6,
+    LK_BTN_RIGHT  = 7,
+    LK_BTN_A      = 8,
+    LK_BTN_X      = 9,
+    LK_BTN_L      = 10,
+    LK_BTN_R      = 11,
 };
 
 /* Host-only: 256×224 RGB565 framebuffer for snes_get_framebuffer.
