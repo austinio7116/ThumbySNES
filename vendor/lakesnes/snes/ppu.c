@@ -111,6 +111,7 @@ Ppu* ppu_init(Snes* snes) {
   memset(ppu->cgramRgb565, 0, sizeof(ppu->cgramRgb565));
   ppu->cgramDirty = 1;
   ppu->skipRender = 0;
+  ppu->halfVertical = 0;
   for (int L = 0; L < 4; L++) ppu->bgLineCacheValid[L] = 0;
   ppu_setPixelOutputFormat(ppu, ppu_pixelOutputFormatBGRX);
   return ppu;
@@ -676,6 +677,16 @@ LAKESNES_HOT void ppu_runLine(Ppu* ppu, int line) {
    * frames we trade perfect OAM side-effect bookkeeping for the full
    * per-line work budget. */
   if (ppu->skipRender) return;
+  /* ThumbySNES half-vertical: skip "blend partner" lines (the second
+   * SNES line mapping to the same device row under 7:4 stride). The
+   * device scanline callback writes the first-hit line as-is when no
+   * partner arrives — horizontal blend preserved, vertical lost. */
+  if (ppu->halfVertical && line >= 2 && line <= 224) {
+    int sy = line - 1;
+    int dy      = (sy * 4) / 7;
+    int dy_prev = ((sy - 1) * 4) / 7;
+    if (dy == dy_prev) return;  /* partner line — skip entirely */
+  }
   /* ThumbySNES LCD mode: lines that don't map to a device row produce
    * no output, and BG/sprite state is re-computed per line, so we can
    * bail before sprite eval + BG cache for the ~43% of SNES lines

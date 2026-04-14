@@ -239,11 +239,19 @@ struct Ppu {
   uint16_t  cgramRgb565[256];
   uint8_t   cgramDirty;
 
-  /* ThumbySNES frameskip hint — when non-zero, ppu_runLine runs the
-   * sprite eval + BG cache prologue (so range/time-over state stays
-   * accurate) but skips per-pixel compositing entirely. snes_core
-   * toggles this for frameskipped frames. */
+  /* ThumbySNES frameskip hint — when non-zero, ppu_runLine skips all
+   * work (sprite eval, BG cache, compositing). snes_core toggles this
+   * for frameskipped frames. */
   uint8_t   skipRender;
+
+  /* ThumbySNES half-vertical mode. When set, ppu_runLine skips "blend
+   * partner" lines — the second SNES line mapping to the same device
+   * row under 7:4 vertical stride. ~96 of 224 lines are skipped,
+   * cutting PPU per-line work by ~43%. The device scanline callback
+   * handles missing partners gracefully (writes the first-hit line
+   * as-is without vertical averaging). Horizontal 2-sample blend is
+   * preserved; only vertical smoothing is lost. */
+  uint8_t   halfVertical;
 };
 
 enum { ppu_pixelOutputFormatXBGR = 0, ppu_pixelOutputFormatBGRX = 1 };

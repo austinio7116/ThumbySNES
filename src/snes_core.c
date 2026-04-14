@@ -43,6 +43,18 @@ static uint16_t   s_pad1 = 0;
  * the core 1 loop. */
 static Snes * volatile s_apu_core1_snes = NULL; /* unused on host */
 
+/* PPU-CPU pipeline: core 0 dispatches ppu_runLine to core 1 via these
+ * flags. Core 1 checks ppu_pipeline_line; if > 0, it runs ppu_runLine
+ * for that line, clears it, and sets ppu_pipeline_done = 1. Core 0
+ * reads ppu_pipeline_done to know if it's safe to dispatch the next
+ * line (or falls back to core-0 render if core 1 is still busy).
+ *
+ * All fields are word-aligned volatile — single-word writes are atomic
+ * on M33, and `volatile` prevents the compiler from caching reads
+ * across the dispatch boundary. */
+volatile int s_ppu_pipeline_line = 0;  /* line to render, 0 = none */
+volatile int s_ppu_pipeline_done = 1;  /* 1 = core 1 idle */
+
 /* Native-LCD mode state. `s_lcd_fb` holds the client's framebuffer so
  * we can re-install it after a frameskipped frame, and so snes_unload
  * can clear it cleanly. */
@@ -137,16 +149,18 @@ snes_result_t snes_run_frame(void)
     s_snes->ppu->skipRender = (uint8_t)(skip_this ? 1 : 0);
     snes_runFrame(s_snes);
     s_snes->ppu->skipRender = 0;
+    /* Drain PPU pipeline — wait for core 1 to finish the last line
+     * before we return (the caller will LCD-present the framebuffer
+     * which must be fully composited). */
+    while (!s_ppu_pipeline_done) { /* spin — at most one line's render */ }
     return SNES_OK;
 }
 
 void snes_unload(void)
 {
-    /* Park core 1 first so it stops poking at snes->apu while we
-     * free it. A sync barrier here would be ideal; on M33 pointer
-     * writes are atomic and core 1's loop re-reads this every
-     * iteration, so the window where it sees a stale pointer is a
-     * single opcode. Good enough. */
+    /* Drain PPU pipeline + park core 1 before freeing snes. */
+    while (!s_ppu_pipeline_done) {}
+    s_ppu_pipeline_line = 0;
     s_apu_core1_snes = NULL;
     if (s_snes) {
         snes_free(s_snes);
@@ -229,19 +243,28 @@ void snes_apu_core1_loop(void)
     for (;;) {
         Snes *s = s_apu_core1_snes;
         if (!s) {
-            /* No ROM loaded — idle without burning 100% CPU. A tight
-             * "cmp + branch" is fine on M33 while waiting for core 0 to
-             * populate the pointer. */
             __asm__ volatile ("nop");
             continue;
         }
-        /* One SPC opcode per iteration. spc_runOpcode advances apu
-         * cycles + ticks DSP + timers internally. Core 1 runs free —
-         * no cycle coupling to CPU. */
+        /* PPU-CPU pipeline: if core 0 dispatched a PPU line, render
+         * it here. This is the pipeline overlap — core 0 is running
+         * CPU for the next line while we render this one. */
+        int line = s_ppu_pipeline_line;
+        if (line > 0) {
+            ppu_runLine(s->ppu, line);
+            s_ppu_pipeline_line = 0;
+            s_ppu_pipeline_done = 1;
+            /* __dmb() not needed — volatile writes are ordered on M33
+             * and ppu_runLine's last store (scanline callback writing
+             * to the LCD framebuffer) is sequenced before these flag
+             * writes by program order. */
+        }
+        /* SPC opcode: run one between PPU dispatches. Core 1 time-
+         * shares between PPU and SPC this way — SPC gets ~60-80% of
+         * core 1's budget (all the time between PPU renders). */
         spc_runOpcode(s->apu->spc);
     }
 #else
-    /* Host / single-core build: this shouldn't ever be called. */
     return;
 #endif
 }
@@ -313,6 +336,11 @@ void snes_set_frameskip(int skip)
     s_frame_ctr = 0;
 }
 
+void snes_set_half_vertical(int enable)
+{
+    if (s_snes) s_snes->ppu->halfVertical = enable ? 1 : 0;
+}
+
 #include "cpu.h"
 #include "spc.h"
 #include "apu.h"
@@ -360,6 +388,7 @@ void          snes_set_skip_color_math(int enable){ (void)enable; }
 void          snes_set_render_x_range(int s, int e){ (void)s; (void)e; }
 void          snes_set_lcd_mode(uint16_t *fb, int w, int h){ (void)fb; (void)w; (void)h; }
 void          snes_set_frameskip(int skip){ (void)skip; }
+void          snes_set_half_vertical(int enable){ (void)enable; }
 uint16_t      snes_dbg_pc(void)          { return 0; }
 uint8_t       snes_dbg_pb(void)          { return 0; }
 uint16_t      snes_dbg_a(void)           { return 0; }

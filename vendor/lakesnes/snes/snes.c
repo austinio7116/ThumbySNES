@@ -289,7 +289,27 @@ LAKESNES_HOT static void snes_runCycle(Snes* snes) {
     if(snes->vPos == 0) snes->dma->hdmaInitRequested = true;
   } else if(snes->hPos == 512) {
     // render the line halfway of the screen for better compatibility
-    if(!snes->inVblank && snes->vPos > 0) ppu_runLine(snes->ppu, snes->vPos);
+    if(!snes->inVblank && snes->vPos > 0) {
+#if defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
+      /* PPU-CPU pipeline: dispatch ppu_runLine to core 1 if it's idle.
+       * Core 0 continues with CPU work for the rest of this line while
+       * core 1 renders. If core 1 is still busy (rendering the previous
+       * line), fall back to core 0 synchronous render so we never
+       * stall the CPU. */
+      extern volatile int s_ppu_pipeline_line;
+      extern volatile int s_ppu_pipeline_done;
+      if (s_ppu_pipeline_done) {
+        s_ppu_pipeline_done = 0;
+        s_ppu_pipeline_line = snes->vPos;
+      } else {
+        /* Core 1 busy — render on core 0. No pipeline overlap this
+         * line but no stall either. */
+        ppu_runLine(snes->ppu, snes->vPos);
+      }
+#else
+      ppu_runLine(snes->ppu, snes->vPos);
+#endif
+    }
   } else if(snes->hPos == 1104) {
     if(!snes->inVblank) snes->dma->hdmaRunRequested = true;
   }

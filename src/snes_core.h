@@ -87,6 +87,12 @@ void snes_set_lcd_mode(uint16_t *fb, int w, int h);
  * Only valid in LCD mode (snes_set_lcd_mode) — classic path ignores. */
 void snes_set_frameskip(int skip);
 
+/* Half-vertical mode: skip "blend partner" SNES lines (~96 of 224)
+ * that map to the same device row as the preceding line under 7:4
+ * vertical stride. Cuts PPU per-line work by ~43%. Horizontal blend
+ * preserved; vertical smoothing lost. */
+void snes_set_half_vertical(int enable);
+
 /* Dual-core APU support. On device builds with THUMBYSNES_DUAL_CORE,
  * CPU + PPU run on core 0 and SPC700 + DSP run on core 1. Core 1
  * calls snes_apu_core1_loop() once at boot; it polls a shared snes

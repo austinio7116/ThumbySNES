@@ -172,6 +172,10 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
     /* Performance: skip subscreen / colour-math fetch. Loses HUD fade
      * effects + transparency but cuts per-pixel work nearly in half. */
     snes_set_skip_color_math(1);
+    /* Half-vertical: skip ~96 "blend partner" lines per frame. Keeps
+     * horizontal 2-sample blend for text readability; loses vertical
+     * smoothing. ~43% fewer PPU line renders. */
+    snes_set_half_vertical(1);
     /* FILL mode crops 16 px off each horizontal edge. The per-line
      * compositor still renders all 256 columns (its inner loops are
      * cheaper per-x than the per-pixel walk was, so skipping the 32
