@@ -746,13 +746,15 @@ LAKESNES_HOT uint8_t snes_cpuRead(void* mem, uint32_t adr) {
   /* Block-map fast path (snes9x2002 architecture). One array lookup
    * replaces the 6-8 if-chain in snes_rread + snes_getAccessTime.
    * Covers ~95% of reads (ROM + WRAM) in 4 instructions.
-   * Cycles are accumulated, not flushed — cpu_runOpcode flushes once
-   * per opcode via snes_flushCycles. */
+   * Cycles accumulated — flushed once per opcode in cpu_runOpcode.
+   * DMA check kept per-access (no-op 99% of the time). */
   {
     uint32_t block = (adr >> SNES_MAP_SHIFT) & (SNES_MAP_BLOCKS - 1);
     uint8_t *ptr = snes->readMap[block];
     if (ptr >= SNES_MAP_LAST) {
-      snes->pendingCycles += snes->readMapSpeed[block];
+      int speed = snes->readMapSpeed[block];
+      dma_handleDma(snes->dma, speed);
+      snes->pendingCycles += speed;
       snes->openBus = ptr[adr & SNES_MAP_MASK];
       return snes->openBus;
     }
@@ -779,7 +781,9 @@ LAKESNES_HOT void snes_cpuWrite(void* mem, uint32_t adr, uint8_t val) {
        * ROM blocks also pass ptr >= SNES_MAP_LAST but are read-only. */
       ptrdiff_t off = ptr - snes->ram;
       if (off >= 0 && off < 0x20000) {
-        snes->pendingCycles += snes->readMapSpeed[block];
+        int speed = snes->readMapSpeed[block];
+        dma_handleDma(snes->dma, speed);
+        snes->pendingCycles += speed;
         snes->openBus = val;
         ptr[adr & SNES_MAP_MASK] = val;
         return;
