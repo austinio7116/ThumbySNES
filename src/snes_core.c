@@ -192,10 +192,16 @@ void snes_get_framebuffer(uint16_t *dst)
 size_t snes_get_audio(int16_t *dst, size_t frames)
 {
     if (!dst || frames == 0) return 0;
-    /* TODO Phase 5: route LakeSnes audio. snes_setSamples(snes, buf, n)
-     * lets the core write samples into a buffer at end-of-frame, but
-     * the timing is per-frame not per-host-buffer. For now, silence. */
-    memset(dst, 0, frames * 2 * sizeof(int16_t));
+    if (!s_snes) {
+        memset(dst, 0, frames * 2 * sizeof(int16_t));
+        return frames;
+    }
+    /* Pull stereo samples from DSP's ring buffer. snes_setSamples
+     * resamples from 32040 Hz to `frames` samples per call. On
+     * dual-core builds the DSP runs on core 1 continuously, so the
+     * sample buffer has fresh data. Race on sampleBuffer/sampleOffset
+     * is benign — worst case is one slightly stale sample. */
+    snes_setSamples(s_snes, dst, (int)frames);
     return frames;
 }
 

@@ -16,6 +16,7 @@
 #include "snes_font.h"
 #include "snes_lcd_gc9107.h"
 #include "snes_buttons.h"
+#include "snes_audio_pwm.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -176,10 +177,13 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
      * horizontal 2-sample blend for text readability; loses vertical
      * smoothing. ~43% fewer PPU line renders. */
     snes_set_half_vertical(1);
-    /* Frameskip: NOT useful with the PPU-CPU pipeline — PPU runs on
-     * core 1 in parallel, so skipping it doesn't speed up core 0's
-     * CPU-bound frame time. The bottleneck is now CPU + bus on core 0.
-     * Kept as opt-in API for future single-core fallback modes. */
+    /* Audio: pull stereo samples from DSP (runs on core 1) and push
+     * mono to the PWM ring buffer. dsp_getSamples resamples from
+     * 32040 Hz to our requested count. We ask for 367 samples/frame
+     * (22050 / 60) — at sub-60 fps emulation the audio plays slower
+     * than real-time (pitch drops) but that's inherent to running
+     * below full speed. */
+    #define AUDIO_SAMPLES_PER_FRAME 367
     /* FILL mode crops 16 px off each horizontal edge. The per-line
      * compositor still renders all 256 columns (its inner loops are
      * cheaper per-x than the per-pixel walk was, so skipping the 32
@@ -238,6 +242,19 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         snes_set_pad(snes_read_pad(send_start, chord_now));
         s_blend_a_dev_y = -1;
         snes_run_frame();
+
+        /* Pull audio from DSP (core 1) → mono → PWM ring buffer. */
+        {
+            static int16_t abuf[AUDIO_SAMPLES_PER_FRAME * 2]; /* stereo */
+            snes_get_audio(abuf, AUDIO_SAMPLES_PER_FRAME);
+            /* Fold stereo to mono — average L+R. */
+            static int16_t mbuf[AUDIO_SAMPLES_PER_FRAME];
+            for (int i = 0; i < AUDIO_SAMPLES_PER_FRAME; i++) {
+                mbuf[i] = (int16_t)(((int)abuf[i * 2] + (int)abuf[i * 2 + 1]) >> 1);
+            }
+            snes_audio_pwm_push(mbuf, AUDIO_SAMPLES_PER_FRAME);
+        }
+
         if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
             memcpy(s_lcd_target + s_blend_a_dev_y * FB_W, s_blend_a, sizeof(s_blend_a));
             s_blend_a_dev_y = -1;
