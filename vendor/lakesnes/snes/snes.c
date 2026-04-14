@@ -291,21 +291,21 @@ LAKESNES_HOT static void snes_runCycle(Snes* snes) {
     // render the line halfway of the screen for better compatibility
     if(!snes->inVblank && snes->vPos > 0) {
 #if defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
-      /* PPU-CPU pipeline: dispatch ppu_runLine to core 1 if it's idle.
-       * Core 0 continues with CPU work for the rest of this line while
-       * core 1 renders. If core 1 is still busy (rendering the previous
-       * line), fall back to core 0 synchronous render so we never
-       * stall the CPU. */
+      /* PPU-CPU pipeline: wait for core 1 to finish the previous line,
+       * then dispatch this line. Core 0 ran CPU opcodes between
+       * hPos=512 of the previous line and now — that's the pipeline
+       * overlap window. The wait here is for the "tail" of the
+       * previous render; it's short when core 1 keeps up, and on
+       * heavy lines the wait is the price we pay.
+       *
+       * We ALWAYS dispatch to core 1 (never fall back to core 0
+       * render) because the scanline blend callback uses shared state
+       * (s_blend_a) — calling it from both cores races. */
       extern volatile int s_ppu_pipeline_line;
       extern volatile int s_ppu_pipeline_done;
-      if (s_ppu_pipeline_done) {
-        s_ppu_pipeline_done = 0;
-        s_ppu_pipeline_line = snes->vPos;
-      } else {
-        /* Core 1 busy — render on core 0. No pipeline overlap this
-         * line but no stall either. */
-        ppu_runLine(snes->ppu, snes->vPos);
-      }
+      while (!s_ppu_pipeline_done) { /* spin — previous line finishing */ }
+      s_ppu_pipeline_done = 0;
+      s_ppu_pipeline_line = snes->vPos;
 #else
       ppu_runLine(snes->ppu, snes->vPos);
 #endif
