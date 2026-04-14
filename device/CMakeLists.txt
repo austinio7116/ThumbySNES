@@ -43,6 +43,7 @@ if(THUMBYSNES_LINK_CORE)
         ${LK_SRC}/snes_other.c   ${LK_SRC}/spc.c
         ${LK_SRC}/statehandler.c
         ${SNES_ROOT}/src/snes_core.c
+        ${SNES_ROOT}/src/cpu_asm.c
         # cpu_fast.c is #included from cpu.c (same TU for inlining)
     )
 
