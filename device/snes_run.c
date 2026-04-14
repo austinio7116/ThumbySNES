@@ -243,19 +243,30 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         s_blend_a_dev_y = -1;
         snes_run_frame();
 
-        /* Pull audio from DSP (core 1) → mono → PWM ring buffer. */
+        /* Pull audio from DSP (core 1) → mono → PWM ring buffer.
+         * Ask for enough samples to fill the time this frame took,
+         * not a fixed 367 (which assumed 60 fps). This keeps the ring
+         * buffer fed at ~22050 Hz regardless of emulation speed. The
+         * DSP resamples its ~534 raw samples per emulated frame to
+         * whatever count we request — at sub-60 fps the same audio
+         * data gets stretched to fill real-time, so pitch is correct
+         * but rhythm is slowed proportionally to emulation speed. */
         {
-            static int16_t abuf[AUDIO_SAMPLES_PER_FRAME * 2]; /* stereo */
-            snes_get_audio(abuf, AUDIO_SAMPLES_PER_FRAME);
-            /* Fold stereo to mono — average L+R. */
-            static int16_t mbuf[AUDIO_SAMPLES_PER_FRAME];
-            for (int i = 0; i < AUDIO_SAMPLES_PER_FRAME; i++) {
-                int s = (int)abuf[i * 2] + (int)abuf[i * 2 + 1]; /* stereo sum */
-                if (s > 32767) s = 32767;
-                if (s < -32768) s = -32768;
-                mbuf[i] = (int16_t)s;
+            int room = snes_audio_pwm_room();
+            /* Don't overfill — cap at ring room and a reasonable max. */
+            int want = room < 1024 ? room : 1024;
+            if (want > 0) {
+                static int16_t abuf[1024 * 2]; /* stereo scratch */
+                snes_get_audio(abuf, want);
+                static int16_t mbuf[1024];
+                for (int i = 0; i < want; i++) {
+                    int s = (int)abuf[i * 2] + (int)abuf[i * 2 + 1];
+                    if (s > 32767) s = 32767;
+                    if (s < -32768) s = -32768;
+                    mbuf[i] = (int16_t)s;
+                }
+                snes_audio_pwm_push(mbuf, want);
             }
-            snes_audio_pwm_push(mbuf, AUDIO_SAMPLES_PER_FRAME);
         }
 
         if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
