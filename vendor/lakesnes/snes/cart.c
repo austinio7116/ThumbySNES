@@ -15,6 +15,12 @@ static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr);
 static uint8_t cart_readExHirom(Cart* cart, uint8_t bank, uint16_t adr);
 static void cart_writeHirom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val);
 
+#if CART_ROM_CACHE_SIZE > 0
+/* Static buffer — lives in BSS (SRAM), not heap. Keeps sizeof(Cart)
+ * small so malloc(sizeof(Cart)) doesn't eat into the thin heap margin. */
+static uint8_t s_romCacheBuf[CART_ROM_CACHE_SIZE];
+#endif
+
 Cart* cart_init(Snes* snes) {
   Cart* cart = malloc(sizeof(Cart));
   cart->snes = snes;
@@ -24,6 +30,10 @@ Cart* cart_init(Snes* snes) {
   cart->romSize = 0;
   cart->ram = NULL;
   cart->ramSize = 0;
+#if CART_ROM_CACHE_SIZE > 0
+  cart->romCache = s_romCacheBuf;
+  cart->romCacheOffset = 0;
+#endif
   return cart;
 }
 

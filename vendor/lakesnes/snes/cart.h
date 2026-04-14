@@ -28,7 +28,7 @@ struct Cart {
   uint32_t ramSize;
 
 #if CART_ROM_CACHE_SIZE > 0
-  uint8_t romCache[CART_ROM_CACHE_SIZE];
+  uint8_t *romCache;        /* points at static buffer, NOT heap */
   uint32_t romCacheOffset;  /* ROM offset that romCache[0] maps to */
 #endif
 };
