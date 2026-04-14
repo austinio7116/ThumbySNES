@@ -662,6 +662,36 @@ void snes_cpuIdle(void* mem, bool waiting) {
 
 LAKESNES_HOT uint8_t snes_cpuRead(void* mem, uint32_t adr) {
   Snes* snes = (Snes*) mem;
+#if defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS
+  /* Fast-path the two most common read patterns (~90% of all CPU reads)
+   * to skip the redundant bank-decode in snes_getAccessTime + snes_rread.
+   *
+   * ROM read: bank 00-3F, adr 8000-FFFF → cycles=8, cart LoROM/HiROM.
+   * WRAM mirror: bank 00-3F, adr 0000-1FFF → cycles=8, ram[adr].
+   *
+   * Both have fixed 8-cycle access time (for banks < 0x40). */
+  {
+    uint8_t bank = adr >> 16;
+    uint16_t addr = adr & 0xffff;
+    if (bank < 0x40) {
+      if (addr >= 0x8000) {
+        /* ROM read — most frequent path */
+        dma_handleDma(snes->dma, 8);
+        snes_runCycles(snes, 8);
+        snes->openBus = cart_read(snes->cart, bank, addr);
+        return snes->openBus;
+      }
+      if (addr < 0x2000) {
+        /* WRAM mirror */
+        dma_handleDma(snes->dma, 8);
+        snes_runCycles(snes, 8);
+        snes->openBus = snes->ram[addr];
+        return snes->openBus;
+      }
+    }
+  }
+#endif
+  /* Slow path — registers, DMA, APU ports, high banks, etc. */
   int cycles = snes_getAccessTime(snes, adr);
   dma_handleDma(snes->dma, cycles);
   snes_runCycles(snes, cycles);
@@ -670,6 +700,33 @@ LAKESNES_HOT uint8_t snes_cpuRead(void* mem, uint32_t adr) {
 
 LAKESNES_HOT void snes_cpuWrite(void* mem, uint32_t adr, uint8_t val) {
   Snes* snes = (Snes*) mem;
+#if defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS
+  {
+    uint8_t bank = adr >> 16;
+    uint16_t addr = adr & 0xffff;
+    if (bank < 0x40) {
+      if (addr < 0x2000) {
+        /* WRAM mirror write — second most common write path */
+        dma_handleDma(snes->dma, 8);
+        snes_runCycles(snes, 8);
+        snes->openBus = val;
+        snes->ram[addr] = val;
+        /* Also need to call cart_write for potential cart RAM at
+         * this range — but LoROM cart RAM is at bank 70-7F, not
+         * 00-3F:0000-1FFF. Safe to skip. */
+        return;
+      }
+    }
+    if (bank == 0x7e || bank == 0x7f) {
+      /* Direct WRAM write */
+      dma_handleDma(snes->dma, 8);
+      snes_runCycles(snes, 8);
+      snes->openBus = val;
+      snes->ram[((bank & 1) << 16) | addr] = val;
+      return;
+    }
+  }
+#endif
   int cycles = snes_getAccessTime(snes, adr);
   dma_handleDma(snes->dma, cycles);
   snes_runCycles(snes, cycles);
