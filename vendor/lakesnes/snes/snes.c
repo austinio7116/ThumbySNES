@@ -55,6 +55,80 @@ void snes_free(Snes* snes) {
   free(snes);
 }
 
+/* ThumbySNES: populate the block-based read map after ROM load / reset.
+ * Each 4 KB block gets either a direct pointer (ROM, WRAM) or a
+ * sentinel (SNES_MAP_SPECIAL) for register regions. */
+static void snes_buildReadMap(Snes* snes) {
+  Cart *cart = snes->cart;
+  for (int block = 0; block < SNES_MAP_BLOCKS; block++) {
+    uint8_t bank = block >> 4;          /* high 8 bits */
+    uint16_t adr_base = (block & 0xf) << 12;  /* low 16 bits, aligned to 4K */
+    uint8_t speed = 8;  /* default */
+
+    /* Banks 7E-7F: WRAM (128 KB, direct map) */
+    if (bank == 0x7e || bank == 0x7f) {
+      snes->readMap[block] = snes->ram + ((bank & 1) << 16) + adr_base;
+      snes->readMapSpeed[block] = 8;
+      continue;
+    }
+
+    /* Banks 00-3F and 80-BF: system area in low half, cart in high */
+    if (bank < 0x40 || (bank >= 0x80 && bank < 0xc0)) {
+      if (adr_base < 0x2000) {
+        /* WRAM mirror */
+        snes->readMap[block] = snes->ram + adr_base;
+        speed = 8;
+      } else if (adr_base >= 0x2000 && adr_base < 0x5000) {
+        /* PPU ($2100), CPU regs ($4200), DMA ($4300), input ($4016) */
+        snes->readMap[block] = SNES_MAP_SPECIAL;
+        speed = (adr_base < 0x4000) ? 6 : (adr_base < 0x4200 ? 12 : 6);
+      } else if (adr_base >= 0x6000 && adr_base < 0x8000) {
+        /* Cart SRAM region (LoROM) or open bus — let slow path handle */
+        snes->readMap[block] = SNES_MAP_SPECIAL;
+        speed = 8;
+      } else if (adr_base >= 0x8000) {
+        /* ROM */
+        if (cart && cart->rom && cart->romSize > 0) {
+          if (cart->type == 1) { /* LoROM */
+            uint32_t off = (((bank & 0x7f) << 15) | (adr_base & 0x7fff)) & (cart->romSize - 1);
+            snes->readMap[block] = cart->rom + off;
+          } else if (cart->type == 2 || cart->type == 3) { /* HiROM / ExHiROM */
+            uint32_t off = (((bank & 0x3f) << 16) | adr_base) & (cart->romSize - 1);
+            snes->readMap[block] = cart->rom + off;
+          } else {
+            snes->readMap[block] = SNES_MAP_SPECIAL;
+          }
+        } else {
+          snes->readMap[block] = SNES_MAP_SPECIAL;
+        }
+        speed = (snes->fastMem && bank >= 0x80) ? 6 : 8;
+      } else {
+        /* 0x5000-0x5FFF: open bus area */
+        snes->readMap[block] = SNES_MAP_SPECIAL;
+        speed = 6;
+      }
+      snes->readMapSpeed[block] = speed;
+      continue;
+    }
+
+    /* Banks 40-7D, C0-FF: all ROM */
+    if (cart && cart->rom && cart->romSize > 0) {
+      if (cart->type == 1) { /* LoROM */
+        uint32_t off = (((bank & 0x7f) << 15) | (adr_base & 0x7fff)) & (cart->romSize - 1);
+        snes->readMap[block] = cart->rom + off;
+      } else if (cart->type == 2 || cart->type == 3) { /* HiROM */
+        uint32_t off = (((bank & 0x3f) << 16) | adr_base) & (cart->romSize - 1);
+        snes->readMap[block] = cart->rom + off;
+      } else {
+        snes->readMap[block] = SNES_MAP_SPECIAL;
+      }
+    } else {
+      snes->readMap[block] = SNES_MAP_SPECIAL;
+    }
+    snes->readMapSpeed[block] = (snes->fastMem && bank >= 0x80) ? 6 : 8;
+  }
+}
+
 void snes_reset(Snes* snes, bool hard) {
   cpu_reset(snes->cpu, hard);
   apu_reset(snes->apu);
@@ -90,6 +164,8 @@ void snes_reset(Snes* snes, bool hard) {
   snes->divideResult = 0x101;
   snes->fastMem = false;
   snes->openBus = 0;
+  snes->pendingCycles = 0;
+  snes_buildReadMap(snes);
 }
 
 void snes_handleState(Snes* snes, StateHandler* sh) {
@@ -567,7 +643,11 @@ static void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
       break;
     }
     case 0x420d: {
-      snes->fastMem = val & 0x1;
+      bool newFast = val & 0x1;
+      if (newFast != snes->fastMem) {
+        snes->fastMem = newFast;
+        snes_buildReadMap(snes); /* speed entries change for banks 80+ */
+      }
       break;
     }
     default: {
@@ -663,35 +743,22 @@ void snes_cpuIdle(void* mem, bool waiting) {
 LAKESNES_HOT uint8_t snes_cpuRead(void* mem, uint32_t adr) {
   Snes* snes = (Snes*) mem;
 #if defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS
-  /* Fast-path the two most common read patterns (~90% of all CPU reads)
-   * to skip the redundant bank-decode in snes_getAccessTime + snes_rread.
-   *
-   * ROM read: bank 00-3F, adr 8000-FFFF → cycles=8, cart LoROM/HiROM.
-   * WRAM mirror: bank 00-3F, adr 0000-1FFF → cycles=8, ram[adr].
-   *
-   * Both have fixed 8-cycle access time (for banks < 0x40). */
+  /* Block-map fast path (snes9x2002 architecture). One array lookup
+   * replaces the 6-8 if-chain in snes_rread + snes_getAccessTime.
+   * Covers ~95% of reads (ROM + WRAM) in 4 instructions.
+   * Cycles are accumulated, not flushed — cpu_runOpcode flushes once
+   * per opcode via snes_flushCycles. */
   {
-    uint8_t bank = adr >> 16;
-    uint16_t addr = adr & 0xffff;
-    if (bank < 0x40) {
-      if (addr >= 0x8000) {
-        /* ROM read — most frequent path */
-        dma_handleDma(snes->dma, 8);
-        snes_runCycles(snes, 8);
-        snes->openBus = cart_read(snes->cart, bank, addr);
-        return snes->openBus;
-      }
-      if (addr < 0x2000) {
-        /* WRAM mirror */
-        dma_handleDma(snes->dma, 8);
-        snes_runCycles(snes, 8);
-        snes->openBus = snes->ram[addr];
-        return snes->openBus;
-      }
+    uint32_t block = (adr >> SNES_MAP_SHIFT) & (SNES_MAP_BLOCKS - 1);
+    uint8_t *ptr = snes->readMap[block];
+    if (ptr >= SNES_MAP_LAST) {
+      snes->pendingCycles += snes->readMapSpeed[block];
+      snes->openBus = ptr[adr & SNES_MAP_MASK];
+      return snes->openBus;
     }
   }
 #endif
-  /* Slow path — registers, DMA, APU ports, high banks, etc. */
+  /* Slow path — PPU, APU, input, registers, DMA, unmapped regions. */
   int cycles = snes_getAccessTime(snes, adr);
   dma_handleDma(snes->dma, cycles);
   snes_runCycles(snes, cycles);
@@ -701,32 +768,26 @@ LAKESNES_HOT uint8_t snes_cpuRead(void* mem, uint32_t adr) {
 LAKESNES_HOT void snes_cpuWrite(void* mem, uint32_t adr, uint8_t val) {
   Snes* snes = (Snes*) mem;
 #if defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS
+  /* Block-map fast path for WRAM writes. ROM writes are no-ops (read-
+   * only), so we only fast-path if the block points into snes->ram.
+   * We detect this by checking if ptr falls within the ram array. */
   {
-    uint8_t bank = adr >> 16;
-    uint16_t addr = adr & 0xffff;
-    if (bank < 0x40) {
-      if (addr < 0x2000) {
-        /* WRAM mirror write — second most common write path */
-        dma_handleDma(snes->dma, 8);
-        snes_runCycles(snes, 8);
+    uint32_t block = (adr >> SNES_MAP_SHIFT) & (SNES_MAP_BLOCKS - 1);
+    uint8_t *ptr = snes->readMap[block];
+    if (ptr >= SNES_MAP_LAST) {
+      /* Check if this block is WRAM (pointer falls within snes->ram).
+       * ROM blocks also pass ptr >= SNES_MAP_LAST but are read-only. */
+      ptrdiff_t off = ptr - snes->ram;
+      if (off >= 0 && off < 0x20000) {
+        snes->pendingCycles += snes->readMapSpeed[block];
         snes->openBus = val;
-        snes->ram[addr] = val;
-        /* Also need to call cart_write for potential cart RAM at
-         * this range — but LoROM cart RAM is at bank 70-7F, not
-         * 00-3F:0000-1FFF. Safe to skip. */
+        ptr[adr & SNES_MAP_MASK] = val;
         return;
       }
     }
-    if (bank == 0x7e || bank == 0x7f) {
-      /* Direct WRAM write */
-      dma_handleDma(snes->dma, 8);
-      snes_runCycles(snes, 8);
-      snes->openBus = val;
-      snes->ram[((bank & 1) << 16) | addr] = val;
-      return;
-    }
   }
 #endif
+  /* Slow path — PPU writes, cart SRAM, register writes, etc. */
   int cycles = snes_getAccessTime(snes, adr);
   dma_handleDma(snes->dma, cycles);
   snes_runCycles(snes, cycles);

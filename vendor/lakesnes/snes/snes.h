@@ -59,6 +59,36 @@ struct Snes {
   // misc
   bool fastMem;
   uint8_t openBus;
+
+  /* ThumbySNES block-based memory map (snes9x2002 architecture).
+   *
+   * 24-bit SNES address space divided into 4 KB blocks (4096 entries).
+   * Each entry is either a direct pointer (for ROM/WRAM — dereference
+   * with block-local offset for ~95% of reads in 3 instructions) or
+   * a sentinel < SNES_MAP_LAST (fall through to slow path for PPU,
+   * APU, registers, DMA).
+   *
+   * Replaces the 6-8 cascading if-chains in snes_rread. With 1.8M
+   * reads/frame, this saves ~10M branch instructions per frame.
+   *
+   * readMapSpeed[block] = access cycle cost (6, 8, or 12) for the
+   * per-opcode cycle accumulator. */
+#define SNES_MAP_SHIFT     12
+#define SNES_MAP_BLOCK     (1 << SNES_MAP_SHIFT)  /* 4096 */
+#define SNES_MAP_MASK      (SNES_MAP_BLOCK - 1)    /* 0xFFF */
+#define SNES_MAP_BLOCKS    4096
+
+#define SNES_MAP_SPECIAL   ((uint8_t*)1)  /* PPU, APU, input, regs, DMA */
+#define SNES_MAP_LAST      ((uint8_t*)16) /* anything >= is a real pointer */
+
+  uint8_t *readMap[SNES_MAP_BLOCKS];
+  uint8_t  readMapSpeed[SNES_MAP_BLOCKS];
+
+  /* Per-opcode cycle accumulator. The block-map fast path adds cycles
+   * here instead of calling snes_runCycles per access. Flushed once
+   * per opcode in cpu_runOpcode via snes_flushCycles. Reduces
+   * snes_runCycles calls from ~1.8M/frame to ~600K/frame. */
+  int pendingCycles;
 };
 
 Snes* snes_init(void);
@@ -68,6 +98,15 @@ void snes_handleState(Snes* snes, StateHandler* sh);
 void snes_runFrame(Snes* snes);
 // used by dma, cpu
 void snes_runCycles(Snes* snes, int cycles);
+
+/* Flush accumulated cycles from the block-map fast path. Called once
+ * per opcode from cpu_runOpcode. */
+static inline void snes_flushCycles(Snes* snes) {
+  if (snes->pendingCycles > 0) {
+    snes_runCycles(snes, snes->pendingCycles);
+    snes->pendingCycles = 0;
+  }
+}
 void snes_syncCycles(Snes* snes, bool start, int syncCycles);
 uint8_t snes_readBBus(Snes* snes, uint8_t adr);
 void snes_writeBBus(Snes* snes, uint8_t adr, uint8_t val);

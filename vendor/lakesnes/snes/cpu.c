@@ -6,6 +6,7 @@
 #include <stdbool.h>
 
 #include "cpu.h"
+#include "snes.h"
 #include "statehandler.h"
 #include "perf.h"
 
@@ -118,6 +119,12 @@ void cpu_handleState(Cpu* cpu, StateHandler* sh) {
 }
 
 LAKESNES_HOT void cpu_runOpcode(Cpu* cpu) {
+  /* Flush cycles accumulated by the block-map fast path during the
+   * previous opcode. One snes_runCycles call per opcode instead of
+   * per memory access — reduces call count ~3x. */
+#if defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS
+  { Snes* _s = (Snes*)cpu->mem; snes_flushCycles(_s); }
+#endif
   if(cpu->resetWanted) {
     cpu->resetWanted = false;
     // reset: brk/interrupt without writes
