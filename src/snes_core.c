@@ -66,11 +66,12 @@ static int8_t     s_lcd_dev_y[239];
 static int        s_frameskip = 0;      /* 0 = no skip, 1 = skip every other, … */
 static int        s_frame_ctr  = 0;
 
-/* Default scanline sink: assemble into a 256x224 RGB565 frame buffer
- * that the (host) frontend can read out via snes_get_framebuffer. The
- * device installs its own callback (downscale + LCD blit) and never
- * touches this buffer. */
+/* Host-only default framebuffer — 256×224 RGB565 = 112 KB.
+ * Device never uses this (installs its own scanline callback).
+ * Gated on THUMBYSNES_DUAL_CORE to save 112 KB of BSS on device. */
+#if !(defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
 static uint16_t   s_default_fb[256 * 224];
+#endif
 
 /* SNES button bit layout LakeSnes expects (from input.c). 0..11. */
 enum {
@@ -88,25 +89,29 @@ enum {
     LK_BTN_B     = 15,
 };
 
-/* Default scanline sink for the RGB565 fast-path callback: plain
- * memcpy into the 256×224 host framebuffer. snes_get_framebuffer
- * hands that buffer to callers. */
+/* Host-only: 256×224 RGB565 framebuffer for snes_get_framebuffer.
+ * On device this is NEVER used (device installs its own scanline
+ * callback) — gated to save 112 KB of BSS. */
+#if !(defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
 static void default_scanline_cb_rgb565(void *user, int line, const uint16_t *src)
 {
     (void)user;
     if (line < 1 || line > 224) return;
     memcpy(s_default_fb + (line - 1) * 256, src, 256 * sizeof(uint16_t));
 }
+#endif
 
 static int snes_emu_init(void)
 {
     if (s_snes) return 1;
     s_snes = snes_init();
     if (!s_snes) return 0;
-    /* Install the RGB565 fast-path callback as the default. Frontends
-     * that want raw BGRX pixelBuffer can override via
-     * snes_set_scanline_cb(). */
+    /* Install the RGB565 fast-path callback as the default. On device
+     * the run loop overrides this with its own blend callback, so the
+     * host-only default_scanline_cb_rgb565 is never called. */
+#if !(defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
     ppu_setScanlineCbRgb565(s_snes->ppu, default_scanline_cb_rgb565, NULL);
+#endif
     return 1;
 }
 
@@ -177,7 +182,11 @@ void snes_unload(void)
 void snes_get_framebuffer(uint16_t *dst)
 {
     if (!dst) return;
+#if !(defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
     memcpy(dst, s_default_fb, sizeof(s_default_fb));
+#else
+    memset(dst, 0, 256 * 224 * sizeof(uint16_t));
+#endif
 }
 
 size_t snes_get_audio(int16_t *dst, size_t frames)
