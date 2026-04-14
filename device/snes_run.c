@@ -250,7 +250,10 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
             /* Fold stereo to mono — average L+R. */
             static int16_t mbuf[AUDIO_SAMPLES_PER_FRAME];
             for (int i = 0; i < AUDIO_SAMPLES_PER_FRAME; i++) {
-                mbuf[i] = (int16_t)(((int)abuf[i * 2] + (int)abuf[i * 2 + 1]) >> 1);
+                int s = (int)abuf[i * 2] + (int)abuf[i * 2 + 1]; /* stereo sum */
+                if (s > 32767) s = 32767;
+                if (s < -32768) s = -32768;
+                mbuf[i] = (int16_t)s;
             }
             snes_audio_pwm_push(mbuf, AUDIO_SAMPLES_PER_FRAME);
         }
