@@ -176,11 +176,10 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
      * horizontal 2-sample blend for text readability; loses vertical
      * smoothing. ~43% fewer PPU line renders. */
     snes_set_half_vertical(1);
-    /* Frameskip: render every other frame. CPU + APU still advance on
-     * skipped frames (game state correct); PPU compositing is fully
-     * suppressed. Doubles game-world speed at the cost of halving
-     * visible refresh rate. */
-    snes_set_frameskip(1);
+    /* Frameskip: NOT useful with the PPU-CPU pipeline — PPU runs on
+     * core 1 in parallel, so skipping it doesn't speed up core 0's
+     * CPU-bound frame time. The bottleneck is now CPU + bus on core 0.
+     * Kept as opt-in API for future single-core fallback modes. */
     /* FILL mode crops 16 px off each horizontal edge. The per-line
      * compositor still renders all 256 columns (its inner loops are
      * cheaper per-x than the per-pixel walk was, so skipping the 32
