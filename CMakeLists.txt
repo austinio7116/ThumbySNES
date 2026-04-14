@@ -74,11 +74,16 @@ endif()
 # ThumbySNES runtime glue
 # ----------------------------------------------------------------------
 add_library(thumbysnes STATIC src/snes_core.c)
+# cpu_fast.c is #included from cpu.c (same TU for inlining)
 target_include_directories(thumbysnes PUBLIC src)
 if(LAKESNES_PRESENT)
     target_link_libraries(thumbysnes PUBLIC lakesnes m)
     target_compile_definitions(thumbysnes PRIVATE THUMBYSNES_HAVE_CORE=1)
 endif()
+
+# CPU fast-path opcode tests
+add_executable(cpu_fast_test src/cpu_fast_test.c src/cpu_fast.c)
+target_include_directories(cpu_fast_test PRIVATE src ${LK_SRC})
 
 # ----------------------------------------------------------------------
 # Phase 0 bench harness (headless N-frame run + timing)

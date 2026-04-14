@@ -9,6 +9,13 @@
 #include "statehandler.h"
 #include "perf.h"
 
+/* ThumbySNES: cpu_fast.c provides register-cached versions of the
+ * top-10 opcodes plus a test suite. Disabled in the dispatch because
+ * the C-level optimization doesn't beat gcc -O3's struct access
+ * optimization, and the fallback check adds overhead for the other
+ * 246 opcodes. Kept as a test harness for future ARM asm work. */
+#define HAS_CPU_FAST 0
+
 /* ThumbySNES devirtualized CPU memory access.
  *
  * Upstream LakeSnes decouples cpu.c from snes.c via function pointers
@@ -150,6 +157,9 @@ LAKESNES_HOT void cpu_runOpcode(Cpu* cpu) {
     cpu_doInterrupt(cpu);
   } else {
     uint8_t opcode = cpu_readOpcode(cpu);
+#if HAS_CPU_FAST
+    if (!cpu_doOpcodeFast(cpu, opcode))
+#endif
     cpu_doOpcode(cpu, opcode);
   }
 }
