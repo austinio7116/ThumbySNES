@@ -28,9 +28,25 @@
 
 ## Performance
 
+### Current (2026-04-14, post-optimization session)
+
+| Scene | FPS | Notes |
+|---|---|---|
+| FFII flying intro | ~20 | Light: 1 BG layer, minimal sprites |
+| FFII menus | ~20-24 | Light-medium |
+| FFII first gameplay scene | ~7.2 | Heavy: full BG + sprites + DMA |
+| Zelda ALTTP title/load | ~16-20 | Medium |
+
+Audio wired end-to-end (DSP → stereo fold → PWM). Plays at correct pitch, rhythm proportionally slower at sub-60 fps. No stuttering.
+
+All buttons working (TBY_BTN_* namespace fix). LB+RB chord = Start / exit for broken MENU buttons.
+
+### Baseline (before optimization session)
+
 - **~4.8 fps** on FF II / Zelda content scenes (full-screen rendering, sprites + BGs)
 - **~9 fps** on idle / blank screens
-- Bottleneck profile (host gprof, M33 likely similar):
+
+### Bottleneck profile (host gprof, M33 likely similar):
   - 47% `ppu_getPixel` (per-pixel layer compositor, layer iteration, palette resolve)
   - 15% `ppu_runLine` (scanline orchestration)
   - 11% `snes_runCycles` (per-cycle scheduler)
@@ -138,4 +154,10 @@ cmake --build build_device -j8
 
 ## Verdict
 
-Functional SNES emulator on stock Thumby Color hardware — fits in 520 KB SRAM, runs LoROM and HiROM games, uses the device's USB-MSC + picker UX. Plays at ~5 fps in content / ~10 fps idle, with no audio and no transparency effects. **Proof of concept achieved**; making it polished would be another phase of work.
+Functional SNES emulator on stock Thumby Color hardware — fits in 520 KB SRAM, runs LoROM and HiROM games, uses the device's USB-MSC + picker UX. Audio working end-to-end. Dual-core: CPU+PPU pipeline on core 0/1, SPC+DSP on core 1 interleaved.
+
+Performance: **7-24 fps depending on scene complexity** (up from 4.8 fps baseline). Light scenes (menus, simple scroll) hit ~20 fps; heavy gameplay scenes (dense sprites, DMA) drop to ~7 fps. Turn-based RPGs (FFII, Chrono Trigger, FF Mystic Quest) are the most playable genre at these rates.
+
+The remaining bottleneck is purely CPU dispatch + bus overhead on core 0 (PPU is fully hidden on core 1). The C emulation overhead ratio is ~10:1 (10 ARM instructions per SNES master cycle). Getting to 30+ fps requires ARM assembly for the 65816 dispatcher (estimated 1.5-2× on CPU) or a fundamentally different emulator architecture.
+
+See `PERF.md` for the complete catalog of every optimization currently active.
