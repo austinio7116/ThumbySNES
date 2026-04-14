@@ -15,7 +15,7 @@ typedef struct Cart Cart;
  * instead of flash XIP. Immune to core-1 SPC/DSP XIP cache thrashing.
  * 16 KB fits within the ~30 KB SRAM headroom (STATUS.md). Set to 0
  * to disable. */
-#define CART_ROM_CACHE_SIZE 16384
+#define CART_ROM_CACHE_SIZE 0  /* disabled — adds per-read overhead that outweighs cache hits */
 
 struct Cart {
   Snes* snes;
