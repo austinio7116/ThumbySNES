@@ -57,6 +57,10 @@ if(THUMBYSNES_LINK_CORE)
         # snes_catchupApu compiles to a no-op; snes_apu_core1_loop is
         # the core 1 entry point.
         THUMBYSNES_DUAL_CORE=1
+        # Devirtualize CPU read/write/idle: direct BL to snes_cpuRead
+        # instead of indirect BLX through function pointer. Saves ~3-5
+        # cycles per call across ~1.8M calls/frame.
+        THUMBYSNES_DIRECT_CPU_CALLS=1
     )
     target_compile_options(lakesnes_dev PRIVATE
         -O3 -fomit-frame-pointer -fstrict-aliasing

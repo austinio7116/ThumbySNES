@@ -9,10 +9,39 @@
 #include "statehandler.h"
 #include "perf.h"
 
+/* ThumbySNES devirtualized CPU memory access.
+ *
+ * Upstream LakeSnes decouples cpu.c from snes.c via function pointers
+ * (cpu->read, cpu->write, cpu->idle). Clean architecture, but on M33
+ * each indirect BLX has a 3-5 cycle branch-prediction penalty vs a
+ * direct BL. With ~1.8M memory accesses per emulated frame, that's
+ * 5-9M wasted cycles (~15-30 ms at 300 MHz).
+ *
+ * THUMBYSNES_DIRECT_CPU_CALLS (set by device CMake) replaces the
+ * indirect calls with direct calls to snes_cpuRead/Write/Idle. The
+ * host build keeps the function pointers for flexibility. */
+#if defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS
+extern uint8_t snes_cpuRead(void* mem, uint32_t adr);
+extern void    snes_cpuWrite(void* mem, uint32_t adr, uint8_t val);
+extern void    snes_cpuIdle(void* mem, bool waiting);
+static inline uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
+  return snes_cpuRead(cpu->mem, adr);
+}
+static inline void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
+  snes_cpuWrite(cpu->mem, adr, val);
+}
+static inline void cpu_idle(Cpu* cpu) {
+  snes_cpuIdle(cpu->mem, false);
+}
+static inline void cpu_idleWait(Cpu* cpu) {
+  snes_cpuIdle(cpu->mem, true);
+}
+#else
 static uint8_t cpu_read(Cpu* cpu, uint32_t adr);
 static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val);
 static void cpu_idle(Cpu* cpu);
 static void cpu_idleWait(Cpu* cpu);
+#endif
 static void cpu_checkInt(Cpu* cpu);
 static uint8_t cpu_readOpcode(Cpu* cpu);
 static uint16_t cpu_readOpcodeWord(Cpu* cpu, bool intCheck);
@@ -133,6 +162,7 @@ void cpu_setIrq(Cpu* cpu, bool state) {
   cpu->irqWanted = state;
 }
 
+#if !(defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS)
 static uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
   return cpu->read(cpu->mem, adr);
 }
@@ -148,6 +178,7 @@ static void cpu_idle(Cpu* cpu) {
 static void cpu_idleWait(Cpu* cpu) {
   cpu->idle(cpu->mem, true);
 }
+#endif
 
 static void cpu_checkInt(Cpu* cpu) {
   cpu->intWanted = cpu->nmiWanted || (cpu->irqWanted && !cpu->i);

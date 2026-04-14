@@ -84,6 +84,21 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
     cart->ram = NULL;
   }
   cart->ramSize = ramSize;
+
+#if CART_ROM_CACHE_SIZE > 0
+  /* Cache the first CART_ROM_CACHE_SIZE bytes of ROM in SRAM. For
+   * LoROM this is bank 00 adr 0x8000-0xBFFF (main game code). For
+   * HiROM this is the first 16 KB of the mapped ROM. The exact hot
+   * region varies per game, but bank-0 code is almost always the
+   * highest-frequency access pattern. */
+  {
+    int cacheLen = romSize < CART_ROM_CACHE_SIZE ? romSize : CART_ROM_CACHE_SIZE;
+    memcpy(cart->romCache, cart->rom, cacheLen);
+    if (cacheLen < CART_ROM_CACHE_SIZE)
+      memset(cart->romCache + cacheLen, 0, CART_ROM_CACHE_SIZE - cacheLen);
+    cart->romCacheOffset = 0;  /* cache maps ROM[0..CART_ROM_CACHE_SIZE) */
+  }
+#endif
 }
 
 bool cart_handleBattery(Cart* cart, bool save, uint8_t* data, int* size) {
@@ -121,13 +136,16 @@ void cart_write(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
   if(((bank >= 0x70 && bank < 0x7e) || bank >= 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
-    // banks 70-7e and f0-ff, adr 0000-7fff
     return cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)];
   }
   bank &= 0x7f;
   if(adr >= 0x8000 || bank >= 0x40) {
-    // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
-    return cart->rom[((bank << 15) | (adr & 0x7fff)) & (cart->romSize - 1)];
+    uint32_t offset = ((bank << 15) | (adr & 0x7fff)) & (cart->romSize - 1);
+#if CART_ROM_CACHE_SIZE > 0
+    uint32_t cacheIdx = offset - cart->romCacheOffset;
+    if (cacheIdx < CART_ROM_CACHE_SIZE) return cart->romCache[cacheIdx];
+#endif
+    return cart->rom[offset];
   }
   return cart->snes->openBus;
 }
@@ -142,12 +160,15 @@ static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val)
 static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
   bank &= 0x7f;
   if(bank < 0x40 && adr >= 0x6000 && adr < 0x8000 && cart->ramSize > 0) {
-    // banks 00-3f and 80-bf, adr 6000-7fff
     return cart->ram[(((bank & 0x3f) << 13) | (adr & 0x1fff)) & (cart->ramSize - 1)];
   }
   if(adr >= 0x8000 || bank >= 0x40) {
-    // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
-    return cart->rom[(((bank & 0x3f) << 16) | adr) & (cart->romSize - 1)];
+    uint32_t offset = (((bank & 0x3f) << 16) | adr) & (cart->romSize - 1);
+#if CART_ROM_CACHE_SIZE > 0
+    uint32_t cacheIdx = offset - cart->romCacheOffset;
+    if (cacheIdx < CART_ROM_CACHE_SIZE) return cart->romCache[cacheIdx];
+#endif
+    return cart->rom[offset];
   }
   return cart->snes->openBus;
 }

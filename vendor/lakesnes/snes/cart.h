@@ -10,6 +10,13 @@ typedef struct Cart Cart;
 #include "snes.h"
 #include "statehandler.h"
 
+/* ThumbySNES hot-ROM SRAM cache size. First N bytes of ROM are copied
+ * into SRAM at load time so the hottest code/data reads hit SRAM
+ * instead of flash XIP. Immune to core-1 SPC/DSP XIP cache thrashing.
+ * 16 KB fits within the ~30 KB SRAM headroom (STATUS.md). Set to 0
+ * to disable. */
+#define CART_ROM_CACHE_SIZE 16384
+
 struct Cart {
   Snes* snes;
   uint8_t type;
@@ -19,6 +26,11 @@ struct Cart {
   uint32_t romSize;
   uint8_t* ram;
   uint32_t ramSize;
+
+#if CART_ROM_CACHE_SIZE > 0
+  uint8_t romCache[CART_ROM_CACHE_SIZE];
+  uint32_t romCacheOffset;  /* ROM offset that romCache[0] maps to */
+#endif
 };
 
 // TODO: how to handle reset & load?
