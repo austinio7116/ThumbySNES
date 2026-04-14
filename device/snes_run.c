@@ -243,10 +243,23 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         s_blend_a_dev_y = -1;
         snes_run_frame();
 
-        /* Audio disabled — at 7-20 fps the DSP produces 1/3 to 1/8 of
-         * the samples the PWM consumes, resulting in badly stretched
-         * audio that's worse than silence. The plumbing works (see
-         * git history) and can be re-enabled when fps is higher. */
+        /* Pull audio from DSP (core 1) → mono → PWM ring buffer. */
+        {
+            int room = snes_audio_pwm_room();
+            int want = room < 1024 ? room : 1024;
+            if (want > 0) {
+                static int16_t abuf[1024 * 2];
+                snes_get_audio(abuf, want);
+                static int16_t mbuf[1024];
+                for (int i = 0; i < want; i++) {
+                    int s = (int)abuf[i * 2] + (int)abuf[i * 2 + 1];
+                    if (s > 32767) s = 32767;
+                    if (s < -32768) s = -32768;
+                    mbuf[i] = (int16_t)s;
+                }
+                snes_audio_pwm_push(mbuf, want);
+            }
+        }
 
         if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {
             memcpy(s_lcd_target + s_blend_a_dev_y * FB_W, s_blend_a, sizeof(s_blend_a));
