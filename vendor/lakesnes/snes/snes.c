@@ -207,10 +207,7 @@ void snes_runFrame(Snes* snes) {
   }
   // then run until we are at vblank, or we end up at next frame
   uint32_t frame = snes->frames;
-#if HAS_CPU_ASM && defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
-  /* ASM batch dispatcher: runs up to 64 opcodes per call with 65816
-   * registers pinned in ARM R4-R11. Falls back to C cpu_runOpcode
-   * for opcodes not in the fast set (226 of 256). */
+#if 0 /* ASM dispatcher disabled — blank screen bug under investigation */
   while(!snes->inVblank && frame == snes->frames) {
     cpu_runBatchAsm(snes->cpu, 64);
   }
