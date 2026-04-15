@@ -207,7 +207,7 @@ void snes_runFrame(Snes* snes) {
   }
   // then run until we are at vblank, or we end up at next frame
   uint32_t frame = snes->frames;
-#if 0 /* ASM dispatcher disabled — blank screen bug under investigation */
+#if HAS_CPU_ASM && defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
   while(!snes->inVblank && frame == snes->frames) {
     cpu_runBatchAsm(snes->cpu, 64);
   }

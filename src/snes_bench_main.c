@@ -100,6 +100,31 @@ int main(int argc, char **argv)
            frameskip ? " frameskip=" : "",
            frameskip ? (frameskip == 1 ? "1" : (frameskip == 2 ? "2" : "N")) : "");
 
+    
+    /* DEBUG: dump CPU + WRAM state */
+    printf("DEBUG: PC=0x%04x PB=%02x A=0x%04x\n", snes_dbg_pc(), snes_dbg_pb(), snes_dbg_a());
+    printf("DEBUG: WRAM[0..15]:");
+    for (int _i = 0; _i < 16; _i++) printf(" %02x", snes_dbg_wram(_i));
+    printf("\n");
+
+    /* Test ROM check: WRAM[$0000] = 'P' (0x50) on pass, 'F' (0x46) on
+     * fail. WRAM[$0001] = test number that failed (0 = none).
+     * WRAM[$0002] = expected, WRAM[$0003] = actual. */
+    {
+        uint8_t marker = snes_dbg_wram(0x0000);
+        uint8_t failed_test = snes_dbg_wram(0x0001);
+        uint8_t expected = snes_dbg_wram(0x0002);
+        uint8_t actual = snes_dbg_wram(0x0003);
+        if (marker == 0x50) {
+            printf("\n*** TEST ROM PASSED (all tests OK) ***\n");
+        } else if (failed_test != 0) {
+            printf("\n*** TEST ROM FAILED at test #%d (expected 0x%02x, got 0x%02x) ***\n",
+                   failed_test, expected, actual);
+        } else if (marker == 0 && failed_test == 0) {
+            printf("\n*** TEST ROM did not complete (no marker set) ***\n");
+        }
+    }
+
     snes_unload();
     munmap((void*)rom, rom_len);
     close(fd);

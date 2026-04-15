@@ -282,6 +282,40 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
             snes_font_draw(fb, fps_str, 1, 0, 0xFFE0);
         }
 
+        /* Test ROM diagnostic overlay: show WRAM[0..4] in bottom-right.
+         * Test ROM writes 'P'=0x50 to WRAM[0] on pass, 'F' to fail,
+         * WRAM[1] = failed test #, WRAM[2]=expected, WRAM[3]=actual,
+         * WRAM[4] = last-reached test #. */
+        {
+            uint8_t w0 = snes_dbg_wram(0);
+            uint8_t w1 = snes_dbg_wram(1);
+            uint8_t w2 = snes_dbg_wram(2);
+            uint8_t w3 = snes_dbg_wram(3);
+            uint8_t w4 = snes_dbg_wram(4);
+            if (w0 == 0x50 || w0 == 0x46 || w4 > 0) {
+                char buf[24];
+                if (w0 == 0x50) {
+                    /* PASS: green */
+                    snprintf(buf, sizeof(buf), "PASS %d", w4);
+                    for (int y = 118; y < 128; y++)
+                        for (int x = 0; x < 64; x++) fb[y * FB_W + x] = 0x0000;
+                    snes_font_draw(fb, buf, 1, 119, 0x07E0);
+                } else if (w0 == 0x46) {
+                    /* FAIL: red, show which test + expected/actual */
+                    snprintf(buf, sizeof(buf), "FAIL%d e%02x a%02x", w1, w2, w3);
+                    for (int y = 118; y < 128; y++)
+                        for (int x = 0; x < 128; x++) fb[y * FB_W + x] = 0x0000;
+                    snes_font_draw(fb, buf, 1, 119, 0xF800);
+                } else {
+                    /* In progress: show last-reached test # */
+                    snprintf(buf, sizeof(buf), "t%d", w4);
+                    for (int y = 118; y < 128; y++)
+                        for (int x = 0; x < 32; x++) fb[y * FB_W + x] = 0x0000;
+                    snes_font_draw(fb, buf, 1, 119, 0xFFE0);
+                }
+            }
+        }
+
         snes_lcd_present(fb);
         frame++;
     }
