@@ -177,6 +177,12 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
      * horizontal 2-sample blend for text readability; loses vertical
      * smoothing. ~43% fewer PPU line renders. */
     snes_set_half_vertical(1);
+    /* Frameskip: render only every (N+1)th frame. CPU + APU still run
+     * at full emulation rate (game logic and audio unaffected). With
+     * the dual-core SPC fix, audio plays at correct realtime pitch
+     * regardless of render rate. Adjust runtime via MENU+UP/DOWN. */
+    static int s_frameskip_setting = 1;   /* 0..2: render 1/1, 1/2, 1/3 */
+    snes_set_frameskip(s_frameskip_setting);
     /* Audio: pull stereo samples from DSP (runs on core 1) and push
      * mono to the PWM ring buffer. dsp_getSamples resamples from
      * 32040 Hz to our requested count. We ask for 367 samples/frame
@@ -209,7 +215,6 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
 
     int exit_pressed = 0;
     int frame = 0;
-    /* Tiny FPS counter — top-left corner. Updated once per second. */
     char fps_str[8] = {0};
     int  fps_frames = 0;
     absolute_time_t fps_window_start = get_absolute_time();
@@ -226,6 +231,17 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
             int held_ms = (int)(absolute_time_diff_us(menu_press_t,
                                   get_absolute_time()) / 1000);
             if (held_ms >= MENU_HOLD_EXIT_MS) exit_pressed = 1;
+            /* MENU + UP/DOWN edge cycles frameskip. Doesn't send Start
+             * (suppresses below) so the game doesn't see a stray Start
+             * press. Up = more skip (faster, choppier), Down = less. */
+            else if (snes_buttons_just_pressed(TBY_BTN_UP) && s_frameskip_setting < 2) {
+                s_frameskip_setting++;
+                snes_set_frameskip(s_frameskip_setting);
+            }
+            else if (snes_buttons_just_pressed(TBY_BTN_DOWN) && s_frameskip_setting > 0) {
+                s_frameskip_setting--;
+                snes_set_frameskip(s_frameskip_setting);
+            }
             else                              send_start  = true;
         }
         menu_was_down = menu_now;
@@ -265,8 +281,8 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
             memcpy(s_lcd_target + s_blend_a_dev_y * FB_W, s_blend_a, sizeof(s_blend_a));
             s_blend_a_dev_y = -1;
         }
-        /* FPS overlay in top-left — small, ~24×8 px so it covers as
-         * little of the picture as possible. Refreshes once per second. */
+        /* FPS counter — top-left, no background fill (overlays the game
+         * directly in bright yellow). Updated once per second. */
         fps_frames++;
         absolute_time_t now = get_absolute_time();
         int64_t window_us = absolute_time_diff_us(fps_window_start, now);
@@ -276,45 +292,7 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
             fps_frames = 0;
             fps_window_start = now;
         }
-        if (fps_str[0]) {
-            for (int y = 0; y < 8; y++)
-                for (int x = 0; x < 24; x++) fb[y * FB_W + x] = 0x0000;
-            snes_font_draw(fb, fps_str, 1, 0, 0xFFE0);
-        }
-
-        /* Test ROM diagnostic overlay: show WRAM[0..4] in bottom-right.
-         * Test ROM writes 'P'=0x50 to WRAM[0] on pass, 'F' to fail,
-         * WRAM[1] = failed test #, WRAM[2]=expected, WRAM[3]=actual,
-         * WRAM[4] = last-reached test #. */
-        {
-            uint8_t w0 = snes_dbg_wram(0);
-            uint8_t w1 = snes_dbg_wram(1);
-            uint8_t w2 = snes_dbg_wram(2);
-            uint8_t w3 = snes_dbg_wram(3);
-            uint8_t w4 = snes_dbg_wram(4);
-            if (w0 == 0x50 || w0 == 0x46 || w4 > 0) {
-                char buf[24];
-                if (w0 == 0x50) {
-                    /* PASS: green */
-                    snprintf(buf, sizeof(buf), "PASS %d", w4);
-                    for (int y = 118; y < 128; y++)
-                        for (int x = 0; x < 64; x++) fb[y * FB_W + x] = 0x0000;
-                    snes_font_draw(fb, buf, 1, 119, 0x07E0);
-                } else if (w0 == 0x46) {
-                    /* FAIL: red, show which test + expected/actual */
-                    snprintf(buf, sizeof(buf), "FAIL%d e%02x a%02x", w1, w2, w3);
-                    for (int y = 118; y < 128; y++)
-                        for (int x = 0; x < 128; x++) fb[y * FB_W + x] = 0x0000;
-                    snes_font_draw(fb, buf, 1, 119, 0xF800);
-                } else {
-                    /* In progress: show last-reached test # */
-                    snprintf(buf, sizeof(buf), "t%d", w4);
-                    for (int y = 118; y < 128; y++)
-                        for (int x = 0; x < 32; x++) fb[y * FB_W + x] = 0x0000;
-                    snes_font_draw(fb, buf, 1, 119, 0xFFE0);
-                }
-            }
-        }
+        if (fps_str[0]) snes_font_draw(fb, fps_str, 1, 0, 0xFFE0);
 
 
         snes_lcd_present(fb);
