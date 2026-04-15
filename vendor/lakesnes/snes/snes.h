@@ -100,13 +100,18 @@ void snes_runFrame(Snes* snes);
 void snes_runCycles(Snes* snes, int cycles);
 
 /* Flush accumulated cycles from the block-map fast path. Called once
- * per opcode from cpu_runOpcode. */
+ * per opcode from cpu_runOpcode. Declared in header for inlining in
+ * cpu.c; also emitted as a real symbol in snes.c for cpu_asm.c. */
 static inline void snes_flushCycles(Snes* snes) {
   if (snes->pendingCycles > 0) {
     snes_runCycles(snes, snes->pendingCycles);
     snes->pendingCycles = 0;
   }
 }
+/* Force a non-inline copy for external callers (cpu_asm.c) */
+#ifndef SNES_FLUSH_EXTERN_DEFINED
+#define SNES_FLUSH_EXTERN_DEFINED
+#endif
 void snes_syncCycles(Snes* snes, bool start, int syncCycles);
 uint8_t snes_readBBus(Snes* snes, uint8_t adr);
 void snes_writeBBus(Snes* snes, uint8_t adr, uint8_t val);

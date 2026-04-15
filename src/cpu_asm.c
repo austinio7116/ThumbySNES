@@ -36,7 +36,7 @@
 extern uint8_t snes_cpuRead(void *mem, uint32_t adr);
 extern void    snes_cpuWrite(void *mem, uint32_t adr, uint8_t val);
 extern void    snes_cpuIdle(void *mem, bool waiting);
-extern void    snes_flushCycles(Snes *snes);
+extern void    snes_flushCycles_extern(Snes *snes);
 extern void    cpu_runOpcode(Cpu *cpu);
 
 #if defined(__arm__) || defined(__thumb__)
@@ -145,7 +145,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r2, =snes_cpuRead\n   str r2, [sp, #" S(FRD) "]\n"
     "ldr r2, =snes_cpuWrite\n  str r2, [sp, #" S(FWR) "]\n"
     "ldr r2, =snes_cpuIdle\n   str r2, [sp, #" S(FID) "]\n"
-    "ldr r2, =snes_flushCycles\n str r2, [sp, #" S(FFL) "]\n"
+    "ldr r2, =snes_flushCycles_extern\n str r2, [sp, #" S(FFL) "]\n"
     "ldr r2, =cpu_runOpcode\n  str r2, [sp, #" S(FRO) "]\n"
 
     /* Load 65816 regs */
@@ -178,13 +178,13 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     ".Lloop:\n"
     "ldr r0, [sp, #" S(FCNT) "]\n"
     "ldr r1, [sp, #" S(FMAX) "]\n"
-    "cmp r0, r1\n bge .Ldone\n"
+    "cmp r0, r1\n bge.w .Ldone\n"
 
     /* Check special states */
-    "ldrb r0, [r10, #" S(CPU_RESETWANTED) "]\n cbnz r0, .Lspecial\n"
-    "ldrb r0, [r10, #" S(CPU_STOPPED) "]\n     cbnz r0, .Lspecial\n"
-    "ldrb r0, [r10, #" S(CPU_WAITING) "]\n      cbnz r0, .Lspecial\n"
-    "ldrb r0, [r10, #" S(CPU_INTWANTED) "]\n    cbnz r0, .Lspecial\n"
+    "ldrb r0, [r10, #" S(CPU_RESETWANTED) "]\n cmp r0, #0\n bne.w .Lspecial\n"
+    "ldrb r0, [r10, #" S(CPU_STOPPED) "]\n     cmp r0, #0\n bne.w .Lspecial\n"
+    "ldrb r0, [r10, #" S(CPU_WAITING) "]\n      cmp r0, #0\n bne.w .Lspecial\n"
+    "ldrb r0, [r10, #" S(CPU_INTWANTED) "]\n    cmp r0, #0\n bne.w .Lspecial\n"
 
     /* Flush pending cycles */
     "mov r0, r11\n ldr r3, [sp, #" S(FFL) "]\n blx r3\n"
@@ -197,36 +197,36 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     /* R0 = opcode */
 
     /* --- Dispatch --- */
-    "cmp r0, #0xD0\n beq .Lo_D0\n"
-    "cmp r0, #0xF0\n beq .Lo_F0\n"
-    "cmp r0, #0x10\n beq .Lo_10\n"
-    "cmp r0, #0x30\n beq .Lo_30\n"
-    "cmp r0, #0x90\n beq .Lo_90\n"
-    "cmp r0, #0xB0\n beq .Lo_B0\n"
-    "cmp r0, #0xA9\n beq .Lo_A9\n"
-    "cmp r0, #0xA5\n beq .Lo_A5\n"
-    "cmp r0, #0xAD\n beq .Lo_AD\n"
-    "cmp r0, #0xB5\n beq .Lo_B5\n"
-    "cmp r0, #0xB9\n beq .Lo_B9\n"
-    "cmp r0, #0xBD\n beq .Lo_BD\n"
-    "cmp r0, #0x85\n beq .Lo_85\n"
-    "cmp r0, #0x8D\n beq .Lo_8D\n"
-    "cmp r0, #0x95\n beq .Lo_95\n"
-    "cmp r0, #0x99\n beq .Lo_99\n"
-    "cmp r0, #0x9D\n beq .Lo_9D\n"
-    "cmp r0, #0xA2\n beq .Lo_A2\n"
-    "cmp r0, #0xA6\n beq .Lo_A6\n"
-    "cmp r0, #0xAE\n beq .Lo_AE\n"
-    "cmp r0, #0xA0\n beq .Lo_A0\n"
-    "cmp r0, #0xA4\n beq .Lo_A4\n"
-    "cmp r0, #0xAC\n beq .Lo_AC\n"
-    "cmp r0, #0xC9\n beq .Lo_C9\n"
-    "cmp r0, #0xC5\n beq .Lo_C5\n"
-    "cmp r0, #0xCD\n beq .Lo_CD\n"
-    "cmp r0, #0x69\n beq .Lo_69\n"
-    "cmp r0, #0x65\n beq .Lo_65\n"
-    "cmp r0, #0x20\n beq .Lo_20\n"
-    "cmp r0, #0x60\n beq .Lo_60\n"
+    "cmp r0, #0xD0\n beq.w .Lo_D0\n"
+    "cmp r0, #0xF0\n beq.w .Lo_F0\n"
+    "cmp r0, #0x10\n beq.w .Lo_10\n"
+    "cmp r0, #0x30\n beq.w .Lo_30\n"
+    "cmp r0, #0x90\n beq.w .Lo_90\n"
+    "cmp r0, #0xB0\n beq.w .Lo_B0\n"
+    "cmp r0, #0xA9\n beq.w .Lo_A9\n"
+    "cmp r0, #0xA5\n beq.w .Lo_A5\n"
+    "cmp r0, #0xAD\n beq.w .Lo_AD\n"
+    "cmp r0, #0xB5\n beq.w .Lo_B5\n"
+    "cmp r0, #0xB9\n beq.w .Lo_B9\n"
+    "cmp r0, #0xBD\n beq.w .Lo_BD\n"
+    "cmp r0, #0x85\n beq.w .Lo_85\n"
+    "cmp r0, #0x8D\n beq.w .Lo_8D\n"
+    "cmp r0, #0x95\n beq.w .Lo_95\n"
+    "cmp r0, #0x99\n beq.w .Lo_99\n"
+    "cmp r0, #0x9D\n beq.w .Lo_9D\n"
+    "cmp r0, #0xA2\n beq.w .Lo_A2\n"
+    "cmp r0, #0xA6\n beq.w .Lo_A6\n"
+    "cmp r0, #0xAE\n beq.w .Lo_AE\n"
+    "cmp r0, #0xA0\n beq.w .Lo_A0\n"
+    "cmp r0, #0xA4\n beq.w .Lo_A4\n"
+    "cmp r0, #0xAC\n beq.w .Lo_AC\n"
+    "cmp r0, #0xC9\n beq.w .Lo_C9\n"
+    "cmp r0, #0xC5\n beq.w .Lo_C5\n"
+    "cmp r0, #0xCD\n beq.w .Lo_CD\n"
+    "cmp r0, #0x69\n beq.w .Lo_69\n"
+    "cmp r0, #0x65\n beq.w .Lo_65\n"
+    "cmp r0, #0x20\n beq.w .Lo_20\n"
+    "cmp r0, #0x60\n beq.w .Lo_60\n"
 
     /* === FALLBACK === */
     ".Lfb:\n"
@@ -364,12 +364,12 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
 
     /* ---- LDA imm (A9) ---- */
     ".Lo_A9:\n"
-    "tst r9, #0x20\n beq .La9_16\n"
+    "tst r9, #0x20\n beq.w .La9_16\n"
     /* 8-bit */
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n"
     "bl .Lint\n bl .Lrd\n"
-    "bfi r4, r0, #0, #8\n bl .Lzn8\n b .Lnext\n"
+    "bfi r4, r0, #0, #8\n bl .Lzn8\n b.w .Lnext\n"
     ".La9_16:\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n"
@@ -378,7 +378,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "add r8, r8, #1\n uxth r8, r8\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S0) "]\n orr r4, r1, r0\n"
-    "mov r0, r4\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r4\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDA dp (A5) ---- */
     ".Lo_A5:\n"
@@ -386,15 +386,15 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n"
-    "tst r9, #0x20\n beq .La5_16\n"
-    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .La5_16\n"
+    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b.w .Lnext\n"
     ".La5_16:\n"
     "bl .Lrd\n str r0, [sp, #" S(S1) "]\n"  /* S1=low byte */
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n adds r1, #1\n uxth r1, r1\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r4, r1, r0\n"
-    "mov r0, r4\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r4\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDA abs (AD) ---- */
     ".Lo_AD:\n"
@@ -402,14 +402,14 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "bl .Lfetch\n"  /* r0=hi adr */
     "ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"  /* ea */
-    "tst r9, #0x20\n beq .Lad_16\n"
-    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .Lad_16\n"
+    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b.w .Lnext\n"
     ".Lad_16:\n"
     "str r1, [sp, #" S(S0) "]\n bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(S0) "]\n adds r1, #1\n bic r1, r1, #0xFF000000\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r4, r1, r0\n"
-    "mov r0, r4\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r4\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDA dp,X (B5) ---- */
     ".Lo_B5:\n"
@@ -418,18 +418,18 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: bl .Lidl\n"  /* indexed */
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n"
-    "tst r9, #0x20\n beq .Lb5_16\n"
-    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .Lb5_16\n"
+    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b.w .Lnext\n"
     ".Lb5_16:\n"
     "bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n adds r1, #1\n uxth r1, r1\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r4, r1, r0\n"
-    "mov r0, r4\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r4\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDA abs,Y (B9) / LDA abs,X (BD) ---- */
-    ".Lo_B9:\n mov r12, r6\n b .Labxy\n"  /* r12 = Y */
+    ".Lo_B9:\n mov r12, r6\n b.w .Labxy\n"  /* r12 = Y */
     ".Lo_BD:\n mov r12, r5\n"             /* r12 = X */
     ".Labxy:\n"
     "str r12, [sp, #" S(S2) "]\n"  /* S2 = index value */
@@ -445,14 +445,14 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n"
     "ldr r1, [sp, #" S(S2) "]\n add r0, r0, r1\n"
     "bic r1, r0, #0xFF000000\n"  /* ea */
-    "tst r9, #0x20\n beq .Labxy16\n"
-    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .Labxy16\n"
+    "bl .Lint\n bl .Lrd\n bfi r4, r0, #0, #8\n bl .Lzn8\n b.w .Lnext\n"
     ".Labxy16:\n"
     "str r1, [sp, #" S(S0) "]\n bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(S0) "]\n adds r1, #1\n bic r1, r1, #0xFF000000\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r4, r1, r0\n"
-    "mov r0, r4\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r4\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- STA dp (85) ---- */
     ".Lo_85:\n"
@@ -460,26 +460,26 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n"
-    "tst r9, #0x20\n beq .L85_16\n"
-    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .L85_16\n"
+    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
     ".L85_16:\n"
     "str r1, [sp, #" S(S1) "]\n"  /* S1 = ea_lo */
     "uxtb r2, r4\n bl .Lwr\n"
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n adds r1, #1\n uxth r1, r1\n"
-    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
 
     /* ---- STA abs (8D) ---- */
     ".Lo_8D:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
-    "tst r9, #0x20\n beq .L8d_16\n"
-    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .L8d_16\n"
+    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
     ".L8d_16:\n"
     "str r1, [sp, #" S(S0) "]\n uxtb r2, r4\n bl .Lwr\n"
     "ldr r1, [sp, #" S(S0) "]\n adds r1, #1\n bic r1, r1, #0xFF000000\n"
-    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
 
     /* ---- STA dp,X (95) ---- */
     ".Lo_95:\n"
@@ -488,16 +488,16 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: bl .Lidl\n"
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n"
-    "tst r9, #0x20\n beq .L95_16\n"
-    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .L95_16\n"
+    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
     ".L95_16:\n"
     "str r1, [sp, #" S(S1) "]\n uxtb r2, r4\n bl .Lwr\n"
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n adds r1, #1\n uxth r1, r1\n"
-    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
 
     /* ---- STA abs,Y (99) / STA abs,X (9D) ---- */
-    ".Lo_99:\n mov r12, r6\n b .Lstabxy\n"
+    ".Lo_99:\n mov r12, r6\n b.w .Lstabxy\n"
     ".Lo_9D:\n mov r12, r5\n"
     ".Lstabxy:\n"
     "str r12, [sp, #" S(S2) "]\n"
@@ -509,26 +509,26 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n"
     "ldr r1, [sp, #" S(S2) "]\n add r0, r0, r1\n"
     "bic r1, r0, #0xFF000000\n"
-    "tst r9, #0x20\n beq .Lstab16\n"
-    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "tst r9, #0x20\n beq.w .Lstab16\n"
+    "uxtb r2, r4\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
     ".Lstab16:\n"
     "str r1, [sp, #" S(S0) "]\n uxtb r2, r4\n bl .Lwr\n"
     "ldr r1, [sp, #" S(S0) "]\n adds r1, #1\n bic r1, r1, #0xFF000000\n"
-    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b .Lnext\n"
+    "lsr r2, r4, #8\n uxtb r2, r2\n bl .Lint\n bl .Lwr\n b.w .Lnext\n"
 
     /* ---- LDX imm (A2) ---- */
     ".Lo_A2:\n"
-    "tst r9, #0x10\n beq .La2_16\n"
+    "tst r9, #0x10\n beq.w .La2_16\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n"
-    "bl .Lint\n bl .Lrd\n mov r5, r0\n bl .Lzn8\n b .Lnext\n"
+    "bl .Lint\n bl .Lrd\n mov r5, r0\n bl .Lzn8\n b.w .Lnext\n"
     ".La2_16:\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n bl .Lrd\n str r0, [sp, #" S(S0) "]\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S0) "]\n orr r5, r1, r0\n"
-    "mov r0, r5\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r5\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDX dp (A6) ---- */
     ".Lo_A6:\n"
@@ -536,43 +536,43 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n"
-    "tst r9, #0x10\n beq .La6_16\n"
-    "bl .Lint\n bl .Lrd\n mov r5, r0\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x10\n beq.w .La6_16\n"
+    "bl .Lint\n bl .Lrd\n mov r5, r0\n bl .Lzn8\n b.w .Lnext\n"
     ".La6_16:\n"
     "bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n adds r1, #1\n uxth r1, r1\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r5, r1, r0\n"
-    "mov r0, r5\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r5\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDX abs (AE) ---- */
     ".Lo_AE:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
-    "tst r9, #0x10\n beq .Lae_16\n"
-    "bl .Lint\n bl .Lrd\n mov r5, r0\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x10\n beq.w .Lae_16\n"
+    "bl .Lint\n bl .Lrd\n mov r5, r0\n bl .Lzn8\n b.w .Lnext\n"
     ".Lae_16:\n"
     "str r1, [sp, #" S(S0) "]\n bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(S0) "]\n adds r1, #1\n bic r1, r1, #0xFF000000\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r5, r1, r0\n"
-    "mov r0, r5\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r5\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDY imm (A0) ---- */
     ".Lo_A0:\n"
-    "tst r9, #0x10\n beq .La0_16\n"
+    "tst r9, #0x10\n beq.w .La0_16\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n"
-    "bl .Lint\n bl .Lrd\n mov r6, r0\n bl .Lzn8\n b .Lnext\n"
+    "bl .Lint\n bl .Lrd\n mov r6, r0\n bl .Lzn8\n b.w .Lnext\n"
     ".La0_16:\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n bl .Lrd\n str r0, [sp, #" S(S0) "]\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S0) "]\n orr r6, r1, r0\n"
-    "mov r0, r6\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r6\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDY dp (A4) ---- */
     ".Lo_A4:\n"
@@ -580,46 +580,46 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n"
-    "tst r9, #0x10\n beq .La4_16\n"
-    "bl .Lint\n bl .Lrd\n mov r6, r0\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x10\n beq.w .La4_16\n"
+    "bl .Lint\n bl .Lrd\n mov r6, r0\n bl .Lzn8\n b.w .Lnext\n"
     ".La4_16:\n"
     "bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n adds r1, #1\n uxth r1, r1\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r6, r1, r0\n"
-    "mov r0, r6\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r6\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- LDY abs (AC) ---- */
     ".Lo_AC:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
-    "tst r9, #0x10\n beq .Lac_16\n"
-    "bl .Lint\n bl .Lrd\n mov r6, r0\n bl .Lzn8\n b .Lnext\n"
+    "tst r9, #0x10\n beq.w .Lac_16\n"
+    "bl .Lint\n bl .Lrd\n mov r6, r0\n bl .Lzn8\n b.w .Lnext\n"
     ".Lac_16:\n"
     "str r1, [sp, #" S(S0) "]\n bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(S0) "]\n adds r1, #1\n bic r1, r1, #0xFF000000\n"
     "bl .Lint\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r6, r1, r0\n"
-    "mov r0, r6\n bl .Lzn16\n b .Lnext\n"
+    "mov r0, r6\n bl .Lzn16\n b.w .Lnext\n"
 
     /* ---- BRANCHES ---- */
-    ".Lo_D0:\n tst r9, #0x02\n beq .Lbtk\n b .Lbnt\n"  /* BNE */
-    ".Lo_F0:\n tst r9, #0x02\n bne .Lbtk\n b .Lbnt\n"  /* BEQ */
-    ".Lo_10:\n tst r9, #0x80\n beq .Lbtk\n b .Lbnt\n"  /* BPL */
-    ".Lo_30:\n tst r9, #0x80\n bne .Lbtk\n b .Lbnt\n"  /* BMI */
-    ".Lo_90:\n tst r9, #0x01\n beq .Lbtk\n b .Lbnt\n"  /* BCC */
-    ".Lo_B0:\n tst r9, #0x01\n bne .Lbtk\n b .Lbnt\n"  /* BCS */
-    ".Lbnt:\n bl .Lint\n bl .Lfetch\n b .Lnext\n"
+    ".Lo_D0:\n tst r9, #0x02\n beq.w .Lbtk\n b .Lbnt\n"  /* BNE */
+    ".Lo_F0:\n tst r9, #0x02\n bne.w .Lbtk\n b .Lbnt\n"  /* BEQ */
+    ".Lo_10:\n tst r9, #0x80\n beq.w .Lbtk\n b .Lbnt\n"  /* BPL */
+    ".Lo_30:\n tst r9, #0x80\n bne.w .Lbtk\n b .Lbnt\n"  /* BMI */
+    ".Lo_90:\n tst r9, #0x01\n beq.w .Lbtk\n b .Lbnt\n"  /* BCC */
+    ".Lo_B0:\n tst r9, #0x01\n bne.w .Lbtk\n b .Lbnt\n"  /* BCS */
+    ".Lbnt:\n bl .Lint\n bl .Lfetch\n b.w .Lnext\n"
     ".Lbtk:\n"
     "bl .Lfetch\n sxtb r0, r0\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lint\n bl .Lidl\n"
-    "ldr r0, [sp, #" S(S0) "]\n add r8, r8, r0\n uxth r8, r8\n b .Lnext\n"
+    "ldr r0, [sp, #" S(S0) "]\n add r8, r8, r0\n uxth r8, r8\n b.w .Lnext\n"
 
     /* ---- CMP imm (C9) ---- */
     ".Lo_C9:\n"
-    "tst r9, #0x20\n beq .Lc9_16\n"
+    "tst r9, #0x20\n beq.w .Lc9_16\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n"
     "bl .Lint\n bl .Lrd\n b .Lcmp8\n"
@@ -637,7 +637,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n"
-    "tst r9, #0x20\n beq .Lc5_16\n"
+    "tst r9, #0x20\n beq.w .Lc5_16\n"
     "bl .Lint\n bl .Lrd\n b .Lcmp8\n"
     ".Lc5_16:\n"
     "bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
@@ -652,7 +652,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
-    "tst r9, #0x20\n beq .Lcd_16\n"
+    "tst r9, #0x20\n beq.w .Lcd_16\n"
     "bl .Lint\n bl .Lrd\n b .Lcmp8\n"
     ".Lcd_16:\n"
     "str r1, [sp, #" S(S0) "]\n bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
@@ -668,7 +668,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "cmp r0, #0x100\n blo 1f\n orr r9, r9, #0x01\n"
     "1: tst r0, #0xFF\n  bne 1f\n orr r9, r9, #0x02\n"
     "1: tst r0, #0x80\n  beq 1f\n orr r9, r9, #0x80\n"
-    "1: b .Lnext\n"
+    "1: b.w .Lnext\n"
 
     ".Lcmp16:\n"
     "movw r1, #0xFFFF\n eor r0, r0, r1\n uxth r1, r4\n"
@@ -677,12 +677,12 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "movw r1, #0\n movt r1, #1\n cmp r0, r1\n blo 1f\n orr r9, r9, #0x01\n"
     "1: uxth r1, r0\n cbnz r1, 1f\n orr r9, r9, #0x02\n"
     "1: tst r0, #0x8000\n beq 1f\n orr r9, r9, #0x80\n"
-    "1: b .Lnext\n"
+    "1: b.w .Lnext\n"
 
     /* ---- ADC imm (69) — binary only ---- */
     ".Lo_69:\n"
-    "tst r9, #0x08\n bne .Lfb\n"  /* decimal -> fallback */
-    "tst r9, #0x20\n beq .L69_16\n"
+    "tst r9, #0x08\n bne.w .Lfb\n"  /* decimal -> fallback */
+    "tst r9, #0x20\n beq.w .L69_16\n"
     /* 8-bit */
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
     "add r8, r8, #1\n uxth r8, r8\n"
@@ -697,7 +697,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: cmp r3, #0x100\n blo 1f\n orr r9, r9, #0x01\n"
     "1: tst r3, #0xFF\n  bne 1f\n orr r9, r9, #0x02\n"
     "1: tst r3, #0x80\n  beq 1f\n orr r9, r9, #0x80\n"
-    "1: bfi r4, r3, #0, #8\n b .Lnext\n"
+    "1: bfi r4, r3, #0, #8\n b.w .Lnext\n"
 
     ".L69_16:\n"
     "ldr r1, [sp, #" S(FK) "]\n lsl r1, r1, #16\n orr r1, r1, r8\n"
@@ -713,16 +713,16 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: movw r2, #0\n movt r2, #1\n cmp r3, r2\n blo 1f\n orr r9, r9, #0x01\n"
     "1: uxth r2, r3\n cbnz r2, 1f\n orr r9, r9, #0x02\n"
     "1: tst r3, #0x8000\n beq 1f\n orr r9, r9, #0x80\n"
-    "1: uxth r4, r3\n b .Lnext\n"
+    "1: uxth r4, r3\n b.w .Lnext\n"
 
     /* ---- ADC dp (65) — binary only ---- */
     ".Lo_65:\n"
-    "tst r9, #0x08\n bne .Lfb\n"
+    "tst r9, #0x08\n bne.w .Lfb\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n"
-    "tst r9, #0x20\n beq .L65_16\n"
+    "tst r9, #0x20\n beq.w .L65_16\n"
     /* 8-bit */
     "bl .Lint\n bl .Lrd\n"
     "and  r1, r4, #0xFF\n and r2, r9, #1\n"
@@ -733,7 +733,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: cmp r3, #0x100\n blo 1f\n orr r9, r9, #0x01\n"
     "1: tst r3, #0xFF\n  bne 1f\n orr r9, r9, #0x02\n"
     "1: tst r3, #0x80\n  beq 1f\n orr r9, r9, #0x80\n"
-    "1: bfi r4, r3, #0, #8\n b .Lnext\n"
+    "1: bfi r4, r3, #0, #8\n b.w .Lnext\n"
     ".L65_16:\n"
     "bl .Lrd\n str r0, [sp, #" S(S1) "]\n"
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
@@ -748,7 +748,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: movw r2, #0\n movt r2, #1\n cmp r3, r2\n blo 1f\n orr r9, r9, #0x01\n"
     "1: uxth r2, r3\n cbnz r2, 1f\n orr r9, r9, #0x02\n"
     "1: tst r3, #0x8000\n beq 1f\n orr r9, r9, #0x80\n"
-    "1: uxth r4, r3\n b .Lnext\n"
+    "1: uxth r4, r3\n b.w .Lnext\n"
 
     /* ---- JSR abs (20) ---- */
     ".Lo_20:\n"
@@ -769,7 +769,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r0, [sp, #" S(FE) "]\n cbz r0, 1f\n"
     "and r7, r7, #0xFF\n orr r7, r7, #0x100\n"
     "1: ldr r0, [sp, #" S(S0) "]\n ldr r1, [sp, #" S(S1) "]\n"
-    "orr r8, r0, r1, lsl #8\n uxth r8, r8\n b .Lnext\n"
+    "orr r8, r0, r1, lsl #8\n uxth r8, r8\n b.w .Lnext\n"
 
     /* ---- RTS (60) ---- */
     ".Lo_60:\n"
@@ -786,7 +786,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: mov r1, r7\n bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S0) "]\n orr r8, r1, r0\n"
     "adds r8, #1\n uxth r8, r8\n"
-    "bl .Lint\n bl .Lidl\n b .Lnext\n"
+    "bl .Lint\n bl .Lidl\n b.w .Lnext\n"
 
     /* === EPILOGUE === */
     ".Ldone:\n"

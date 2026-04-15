@@ -193,6 +193,13 @@ void snes_handleState(Snes* snes, StateHandler* sh) {
   cart_handleState(snes->cart, sh);
 }
 
+#if __has_include("cpu_asm.h")
+#include "cpu_asm.h"
+#define HAS_CPU_ASM 1
+#else
+#define HAS_CPU_ASM 0
+#endif
+
 void snes_runFrame(Snes* snes) {
   // run until we are starting a new frame (leaving vblank)
   while(snes->inVblank) {
@@ -200,17 +207,21 @@ void snes_runFrame(Snes* snes) {
   }
   // then run until we are at vblank, or we end up at next frame
   uint32_t frame = snes->frames;
+#if HAS_CPU_ASM && defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
+  /* ASM batch dispatcher: runs up to 64 opcodes per call with 65816
+   * registers pinned in ARM R4-R11. Falls back to C cpu_runOpcode
+   * for opcodes not in the fast set (226 of 256). */
   while(!snes->inVblank && frame == snes->frames) {
-    /* Batch: run multiple opcodes per loop iteration to amortize the
-     * outer-loop overhead (while-check + inVblank load). With 600K+
-     * opcodes per frame, batching by 8 saves ~500K redundant loop
-     * iterations. The inner check after each opcode catches vblank
-     * transitions so we don't overshoot. */
+    cpu_runBatchAsm(snes->cpu, 64);
+  }
+#else
+  while(!snes->inVblank && frame == snes->frames) {
     for (int _b = 0; _b < 8; _b++) {
       cpu_runOpcode(snes->cpu);
       if (snes->inVblank || snes->frames != frame) break;
     }
   }
+#endif
   snes_catchupApu(snes);
 }
 
@@ -306,6 +317,12 @@ LAKESNES_HOT void snes_runCycles(Snes* snes, int cycles) {
     }
     snes->irqCondition = condition;
   }
+}
+
+/* Non-inline version for external callers (cpu_asm.c).
+ * The static inline in snes.h is used by cpu.c. */
+void snes_flushCycles_extern(Snes* snes) {
+  snes_flushCycles(snes);
 }
 
 void snes_syncCycles(Snes* snes, bool start, int syncCycles) {
