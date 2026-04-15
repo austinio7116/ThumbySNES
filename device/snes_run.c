@@ -316,6 +316,7 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
             }
         }
 
+
         snes_lcd_present(fb);
         frame++;
     }

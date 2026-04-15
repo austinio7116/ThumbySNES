@@ -122,6 +122,16 @@ void snes_set_scanline_cb_rgb565(void (*cb)(void *user, int line, const uint16_t
 uint16_t snes_dbg_pc(void);          /* CPU program counter (16-bit, in current PB) */
 uint8_t  snes_dbg_pb(void);          /* CPU program bank */
 uint16_t snes_dbg_a(void);
+/* ASM dispatcher trace — last opcode dispatched, the PB:PC it was at, and
+ * total opcode count since core load. Updated on every dispatch by the
+ * Thumb-2 inline-asm batch loop; under the C path these stay 0. */
+uint8_t  snes_dbg_last_op(void);
+uint8_t  snes_dbg_last_pb(void);
+uint16_t snes_dbg_last_pc(void);
+uint32_t snes_dbg_op_count(void);
+uint32_t snes_dbg_frames(void);
+uint16_t snes_dbg_vpos(void);
+uint8_t  snes_dbg_in_vblank(void);
 uint8_t  snes_dbg_brightness(void);  /* PPU brightness $2100 low nibble (0..15) */
 uint8_t  snes_dbg_forced_blank(void);/* 1 if PPU is in forced blank */
 uint8_t  snes_dbg_wram(uint32_t addr); /* WRAM byte at addr (& 0x1FFFF) */

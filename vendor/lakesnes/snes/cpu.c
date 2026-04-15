@@ -125,6 +125,14 @@ LAKESNES_HOT void cpu_runOpcode(Cpu* cpu) {
 #if defined(THUMBYSNES_DIRECT_CPU_CALLS) && THUMBYSNES_DIRECT_CPU_CALLS
   { Snes* _s = (Snes*)cpu->mem; snes_flushCycles(_s); }
 #endif
+#if defined(THUMBYSNES_ASM_TRACE) && THUMBYSNES_ASM_TRACE
+  /* Trace: also bump the count and snapshot PB/PC from the C path so
+   * the on-device overlay shows progress when control is in C (vblank
+   * loop, special-state path, etc.). */
+  cpu->lastPb = cpu->k;
+  cpu->lastPc = cpu->pc;
+  cpu->opcodeCount++;
+#endif
   if(cpu->resetWanted) {
     cpu->resetWanted = false;
     // reset: brk/interrupt without writes
@@ -164,6 +172,9 @@ LAKESNES_HOT void cpu_runOpcode(Cpu* cpu) {
     cpu_doInterrupt(cpu);
   } else {
     uint8_t opcode = cpu_readOpcode(cpu);
+#if defined(THUMBYSNES_ASM_TRACE) && THUMBYSNES_ASM_TRACE
+    cpu->lastOpcode = opcode;
+#endif
 #if HAS_CPU_FAST
     if (!cpu_doOpcodeFast(cpu, opcode))
 #endif

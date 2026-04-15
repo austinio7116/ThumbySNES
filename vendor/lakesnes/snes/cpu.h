@@ -46,6 +46,11 @@ struct Cpu {
   bool nmiWanted;
   bool intWanted;
   bool resetWanted;
+  // ASM dispatcher trace (written every dispatched opcode; readable by host)
+  uint8_t lastOpcode;
+  uint8_t lastPb;
+  uint16_t lastPc;
+  uint32_t opcodeCount;
 };
 
 Cpu* cpu_init(void* mem, CpuReadHandler read, CpuWriteHandler write, CpuIdleHandler idle);

@@ -372,6 +372,13 @@ void snes_set_half_vertical(int enable)
 uint16_t snes_dbg_pc(void)         { return s_snes ? s_snes->cpu->pc : 0; }
 uint8_t  snes_dbg_pb(void)         { return s_snes ? s_snes->cpu->k  : 0; }
 uint16_t snes_dbg_a(void)          { return s_snes ? s_snes->cpu->a  : 0; }
+uint8_t  snes_dbg_last_op(void)    { return s_snes ? s_snes->cpu->lastOpcode : 0; }
+uint8_t  snes_dbg_last_pb(void)    { return s_snes ? s_snes->cpu->lastPb     : 0; }
+uint16_t snes_dbg_last_pc(void)    { return s_snes ? s_snes->cpu->lastPc     : 0; }
+uint32_t snes_dbg_op_count(void)   { return s_snes ? s_snes->cpu->opcodeCount: 0; }
+uint32_t snes_dbg_frames(void)     { return s_snes ? s_snes->frames           : 0; }
+uint16_t snes_dbg_vpos(void)       { return s_snes ? s_snes->vPos             : 0; }
+uint8_t  snes_dbg_in_vblank(void)  { return (s_snes && s_snes->inVblank) ? 1 : 0; }
 uint8_t  snes_dbg_brightness(void) { return s_snes ? s_snes->ppu->brightness : 0; }
 uint8_t  snes_dbg_forced_blank(void){ return (s_snes && s_snes->ppu->forcedBlank) ? 1 : 0; }
 uint8_t  snes_dbg_wram(uint32_t addr) {
@@ -424,5 +431,12 @@ uint32_t      snes_dbg_apu_cycles(void){ return 0; }
 uint8_t       snes_dbg_rom_byte_lorom(uint32_t b, uint16_t a){ (void)b; (void)a; return 0; }
 uint16_t      snes_dbg_spc_pc(void){ return 0; }
 uint8_t       snes_dbg_apu_in(int idx){ (void)idx; return 0; }
+uint8_t       snes_dbg_last_op(void) { return 0; }
+uint8_t       snes_dbg_last_pb(void) { return 0; }
+uint16_t      snes_dbg_last_pc(void) { return 0; }
+uint32_t      snes_dbg_op_count(void){ return 0; }
+uint32_t      snes_dbg_frames(void)  { return 0; }
+uint16_t      snes_dbg_vpos(void)    { return 0; }
+uint8_t       snes_dbg_in_vblank(void){ return 0; }
 
 #endif

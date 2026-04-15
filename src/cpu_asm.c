@@ -41,6 +41,15 @@ extern void    cpu_runOpcode(Cpu *cpu);
 
 #if defined(__arm__) || defined(__thumb__)
 
+/* Per-opcode trace tracking (lastOpcode/lastPb/lastPc/opcodeCount) is
+ * useful to debug ASM-dispatcher hangs but adds 6 instructions per
+ * dispatch. Off by default; build with -DTHUMBYSNES_ASM_TRACE=1 to
+ * re-enable. The matching trace bumps in cpu.c (C path) are gated on
+ * the same flag for consistency. */
+#ifndef THUMBYSNES_ASM_TRACE
+#define THUMBYSNES_ASM_TRACE 0
+#endif
+
 /* Cpu struct field offsets — verified by _Static_assert below. */
 #define CPU_MEM    0
 #define CPU_A      16
@@ -66,6 +75,10 @@ extern void    cpu_runOpcode(Cpu *cpu);
 #define CPU_NMIWANTED  42
 #define CPU_INTWANTED  43
 #define CPU_RESETWANTED 44
+#define CPU_LASTOPCODE  45
+#define CPU_LASTPB      46
+#define CPU_LASTPC      48  /* uint16_t — needs 2-byte alignment */
+#define CPU_OPCNT       52  /* uint32_t — needs 4-byte alignment */
 
 _Static_assert(offsetof(Cpu, mem) == CPU_MEM, "");
 _Static_assert(offsetof(Cpu, a)   == CPU_A,   "");
@@ -91,6 +104,10 @@ _Static_assert(offsetof(Cpu, irqWanted)   == CPU_IRQWANTED,   "");
 _Static_assert(offsetof(Cpu, nmiWanted)   == CPU_NMIWANTED,   "");
 _Static_assert(offsetof(Cpu, intWanted)   == CPU_INTWANTED,   "");
 _Static_assert(offsetof(Cpu, resetWanted) == CPU_RESETWANTED, "");
+_Static_assert(offsetof(Cpu, lastOpcode)  == CPU_LASTOPCODE,  "");
+_Static_assert(offsetof(Cpu, lastPb)      == CPU_LASTPB,      "");
+_Static_assert(offsetof(Cpu, lastPc)      == CPU_LASTPC,      "");
+_Static_assert(offsetof(Cpu, opcodeCount) == CPU_OPCNT,       "");
 
 /*
  * Stack frame. SP is constant after prologue SUB.
@@ -121,7 +138,8 @@ _Static_assert(offsetof(Cpu, resetWanted) == CPU_RESETWANTED, "");
 #define S2    56
 #define S3    60
 #define S4    64
-#define FSZ   72
+#define SR0   68    /* saved caller-r0 across .Lidl/.Lwr (which clobber r0) */
+#define FSZ   80    /* 8-byte aligned (was 72; +8 for SR0 + alignment) */
 
 #define _S(x) #x
 #define S(x) _S(x)
@@ -192,9 +210,20 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     /* Fetch opcode at (K<<16)|PC */
     "ldr r1, [sp, #" S(FK) "]\n"
     "lsl r1, r1, #16\n orr r1, r1, r8\n"
+#if THUMBYSNES_ASM_TRACE
+    /* TRACE: store K and PC of the opcode about to dispatch (PC pre-increment) */
+    "ldrb r2, [sp, #" S(FK) "]\n strb r2, [r10, #" S(CPU_LASTPB) "]\n"
+    "strh r8, [r10, #" S(CPU_LASTPC) "]\n"
+#endif
     "add r8, r8, #1\n uxth r8, r8\n"
     "mov r0, r11\n ldr r3, [sp, #" S(FRD) "]\n blx r3\n"
     /* R0 = opcode */
+#if THUMBYSNES_ASM_TRACE
+    /* TRACE: store opcode + bump counter */
+    "strb r0, [r10, #" S(CPU_LASTOPCODE) "]\n"
+    "ldr  r2, [r10, #" S(CPU_OPCNT) "]\n adds r2, r2, #1\n"
+    "str  r2, [r10, #" S(CPU_OPCNT) "]\n"
+#endif
 
     /* --- Jump table dispatch (256 entries, zero fallback) --- */
     "ldr  r12, =.Ljt\n"
@@ -313,21 +342,28 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
 
     /*
      * .Lwr — write byte R2 at address R1. Non-leaf.
+     * Preserves R0 across the call (callers commonly hold a value in R0
+     * that they want to use after the write — e.g. for .Lzn8/.Lzn16).
      */
     ".Lwr:\n"
+    "str  r0, [sp, #" S(SR0) "]\n"
     "str  lr, [sp, #" S(FLR) "]\n"
     "mov  r0, r11\n"
     "ldr  r3, [sp, #" S(FWR) "]\n blx r3\n"
-    "ldr  lr, [sp, #" S(FLR) "]\n bx lr\n"
+    "ldr  lr, [sp, #" S(FLR) "]\n"
+    "ldr  r0, [sp, #" S(SR0) "]\n bx lr\n"
 
     /*
      * .Lidl — idle cycle. Non-leaf.
+     * Preserves R0 across the call.
      */
     ".Lidl:\n"
+    "str  r0, [sp, #" S(SR0) "]\n"
     "str  lr, [sp, #" S(FLR) "]\n"
     "mov  r0, r11\n movs r1, #0\n"
     "ldr  r3, [sp, #" S(FID) "]\n blx r3\n"
-    "ldr  lr, [sp, #" S(FLR) "]\n bx lr\n"
+    "ldr  lr, [sp, #" S(FLR) "]\n"
+    "ldr  r0, [sp, #" S(SR0) "]\n bx lr\n"
 
     /* ========================================== */
     /* OPCODES                                    */
@@ -1439,7 +1475,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "orr  r0, r0, r1, lsl #15\n"
     "bfi  r9, r2, #0, #1\n bx lr\n"
     ".Lrmw8_body:\n"
-    "bl .Lrd\n"                            /* r0 = value */
+    "bl .Lrd\n"                            /* r0 = value (preserved by .Lidl) */
     "bl .Lidl\n"                           /* modify cycle */
     "str lr, [sp, #" S(FLR) "]\n"
     "ldr r3, [sp, #" S(S4) "]\n blx r3\n"
@@ -1452,7 +1488,7 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n adds r1, #1\n bic r1, r1, #0xFF000000\n"
     "bl .Lrd\n"
     "lsl r0, r0, #8\n ldr r1, [sp, #" S(S1) "]\n orr r0, r1, r0\n"  /* 16-bit value */
-    "bl .Lidl\n"                           /* modify cycle */
+    "bl .Lidl\n"                           /* modify cycle (r0 preserved) */
     "str lr, [sp, #" S(FLR) "]\n"
     "ldr r3, [sp, #" S(S4) "]\n blx r3\n"
     "ldr lr, [sp, #" S(FLR) "]\n"
@@ -1469,16 +1505,16 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lasl_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lasl_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lasl_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lasl_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_0E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
     "bic r1, r1, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lasl_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lasl_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lasl_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lasl_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_16:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
@@ -1486,8 +1522,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lasl_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lasl_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lasl_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lasl_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_1E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
@@ -1497,24 +1533,24 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n add r0, r0, r5\n"
     "bic r1, r0, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lasl_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lasl_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lasl_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lasl_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_46:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Llsr_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Llsr_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Llsr_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Llsr_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_4E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
     "bic r1, r1, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Llsr_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Llsr_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Llsr_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Llsr_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_56:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
@@ -1522,8 +1558,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Llsr_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Llsr_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Llsr_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Llsr_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_5E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
@@ -1533,24 +1569,24 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n add r0, r0, r5\n"
     "bic r1, r0, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Llsr_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Llsr_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Llsr_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Llsr_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_26:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lrol_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lrol_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lrol_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lrol_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_2E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
     "bic r1, r1, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lrol_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lrol_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lrol_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lrol_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_36:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
@@ -1558,8 +1594,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lrol_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lrol_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lrol_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lrol_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_3E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
@@ -1569,24 +1605,24 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n add r0, r0, r5\n"
     "bic r1, r0, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lrol_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lrol_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lrol_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lrol_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_66:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lror_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lror_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lror_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lror_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_6E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
     "bic r1, r1, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lror_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lror_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lror_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lror_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_76:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
@@ -1594,8 +1630,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lror_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lror_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lror_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lror_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_7E:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
@@ -1605,8 +1641,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n add r0, r0, r5\n"
     "bic r1, r0, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Lror_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Lror_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Lror_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Lror_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Linc_rmw8:\n"
     "uxtb r0, r0\n add r0, r0, #1\n uxtb r0, r0\n bx lr\n"
     ".Linc_rmw16:\n"
@@ -1621,16 +1657,16 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Linc_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Linc_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Linc_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Linc_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_EE:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
     "bic r1, r1, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Linc_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Linc_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Linc_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Linc_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_F6:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
@@ -1638,8 +1674,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Linc_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Linc_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Linc_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Linc_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_FE:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
@@ -1649,24 +1685,24 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n add r0, r0, r5\n"
     "bic r1, r0, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Linc_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Linc_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Linc_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Linc_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_C6:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
     "1: ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Ldec_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Ldec_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Ldec_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Ldec_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_CE:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
     "ldr r0, [sp, #" S(FDB) "]\n add r1, r1, r0, lsl #16\n"
     "bic r1, r1, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Ldec_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Ldec_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Ldec_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Ldec_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_D6:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "ldr r0, [sp, #" S(FDP) "]\n tst r0, #0xFF\n beq 1f\n bl .Lidl\n"
@@ -1674,8 +1710,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(FDP) "]\n ldr r0, [sp, #" S(S0) "]\n"
     "add r1, r1, r0\n add r1, r1, r5\n uxth r1, r1\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Ldec_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Ldec_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Ldec_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Ldec_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lo_DE:\n"
     "bl .Lfetch\n str r0, [sp, #" S(S0) "]\n"
     "bl .Lfetch\n ldr r1, [sp, #" S(S0) "]\n orr r1, r1, r0, lsl #8\n"
@@ -1685,8 +1721,8 @@ int cpu_runBatchAsm(Cpu *cpu, int maxOpcodes)
     "ldr r1, [sp, #" S(S0) "]\n add r0, r0, r1\n add r0, r0, r5\n"
     "bic r1, r0, #0xFF000000\n str r1, [sp, #" S(S0) "]\n"
     "tst r9, #0x20\n beq.w 2f\n"
-    "ldr r3, =.Ldec_rmw8\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
-    "2: ldr r3, =.Ldec_rmw16\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
+    "ldr r3, =.Ldec_rmw8+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw8_body\n"
+    "2: ldr r3, =.Ldec_rmw16+1\n str r3, [sp, #" S(S4) "]\n b.w .Lrmw16_body\n"
     ".Lcmpx8:\n"
     "uxtb r1, r1\n"                        /* index low byte */
     "eor  r0, r0, #0xFF\n and r1, r1, #0xFF\n"
