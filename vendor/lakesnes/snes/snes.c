@@ -758,7 +758,7 @@ LAKESNES_HOT uint8_t snes_read(Snes* snes, uint32_t adr) {
 void snes_cpuIdle(void* mem, bool waiting) {
   Snes* snes = (Snes*) mem;
   dma_handleDma(snes->dma, 6);
-  snes_runCycles(snes, 6);
+  snes_runCyclesFast(snes, 6);
 }
 
 LAKESNES_HOT uint8_t snes_cpuRead(void* mem, uint32_t adr) {
@@ -784,7 +784,7 @@ LAKESNES_HOT uint8_t snes_cpuRead(void* mem, uint32_t adr) {
   /* Slow path — PPU, APU, input, registers, DMA, unmapped regions. */
   int cycles = snes_getAccessTime(snes, adr);
   dma_handleDma(snes->dma, cycles);
-  snes_runCycles(snes, cycles);
+  snes_runCyclesFast(snes, cycles);
   return snes_read(snes, adr);
 }
 
@@ -815,7 +815,7 @@ LAKESNES_HOT void snes_cpuWrite(void* mem, uint32_t adr, uint8_t val) {
   /* Slow path — PPU writes, cart SRAM, register writes, etc. */
   int cycles = snes_getAccessTime(snes, adr);
   dma_handleDma(snes->dma, cycles);
-  snes_runCycles(snes, cycles);
+  snes_runCyclesFast(snes, cycles);
   snes_write(snes, adr, val);
 }
 

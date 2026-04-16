@@ -655,6 +655,146 @@ static void ppu_buildWindowMask(Ppu* ppu, int layer, uint8_t *mask) {
   }
 }
 
+/* ThumbySNES tile-major BG slot emitter (Lever 3).
+ *
+ * Walks the tilemap for (layer, priority) slot P, decodes each tile
+ * (or hits the #27 tile-row cache), and emits 8 RGB565 pixels
+ * directly into `out[]` — skipping the bgLine[L][P] intermediate
+ * buffer that the old two-pass flow wrote then read back.
+ *
+ * Cost vs the old flow:
+ *   + tilemap walk is done twice per BG layer (once per priority slot),
+ *     where the old ppu_renderBgLine did one walk filling both prio
+ *     buffers. Tile-cache hits make the extra walk cheap.
+ *   - saves 2 KB of bgLine write + 256-wide bgLine read per slot
+ *     (two slots per layer) — roughly 900 KB/frame of SRAM traffic.
+ *
+ * Only invoked when the "simple" fast-path mode is eligible (no
+ * mosaic / mode 7 / hires 5/6 / OPT). The slow-path branch in
+ * ppu_composeLineRgb565 still handles those.
+ *
+ * The emit overwrites non-zero pixels (bottom-up compose order),
+ * matching the existing BG fast-path semantics.  */
+LAKESNES_HOT static void ppu_emitBgSlotRgb565(Ppu* ppu, int layer,
+                                              bool matchPrio, int line,
+                                              uint16_t *out,
+                                              const uint16_t *cg,
+                                              bool windowed,
+                                              const uint8_t *winMask) {
+  int hScroll = ppu->bgLayer[layer].hScroll;
+  int vScroll = ppu->bgLayer[layer].vScroll;
+  int y       = line + vScroll;
+
+  bool tilemapHigher = ppu->bgLayer[layer].tilemapHigher;
+  bool tilemapWider  = ppu->bgLayer[layer].tilemapWider;
+  bool bigTiles      = ppu->bgLayer[layer].bigTiles;
+  uint16_t tilemapBase = ppu->bgLayer[layer].tilemapAdr;
+  uint16_t tileAdrBase = ppu->bgLayer[layer].tileAdr;
+  int bitDepth = bitDepthsPerMode[ppu->mode][layer];
+  int paletteSize = (bitDepth == 2) ? 4 : (bitDepth == 4 ? 16 : 256);
+
+  int tileBitsY = bigTiles ? 4 : 3;
+  int tileHighBitY = bigTiles ? 0x200 : 0x100;
+  int tileBitsX = 3;
+  int tileHighBitX = 0x100;
+
+  uint32_t tcLayerBits = ((uint32_t)((tileAdrBase >> 12) & 0xf) << 20)
+                       | ((uint32_t)(bitDepth == 2 ? 0
+                                   : bitDepth == 4 ? 1 : 2) << 24);
+
+  uint16_t rowOffset = ((y >> tileBitsY) & 0x1f) << 5;
+  bool yIntoSecondMap = (y & tileHighBitY) && tilemapHigher;
+  uint16_t yMapBase = tilemapBase + rowOffset;
+  if (yIntoSecondMap) yMapBase += tilemapWider ? 0x800 : 0x400;
+
+  int outX = -(hScroll & 0x7);
+  int srcX = hScroll & ~0x7;
+  while (outX < 256) {
+    uint16_t mapAdr = yMapBase + ((srcX >> tileBitsX) & 0x1f);
+    if ((srcX & tileHighBitX) && tilemapWider) mapAdr += 0x400;
+    uint16_t tile = ppu->vram[mapAdr & 0x7fff];
+    bool prio = (tile & 0x2000) != 0;
+    if (prio != matchPrio) { outX += 8; srcX += 8; continue; }
+
+    int paletteNum = (tile & 0x1c00) >> 10;
+    int tileNum = tile & 0x3ff;
+    if (bigTiles) {
+      if (((bool)(y & 8)) ^ ((bool)(tile & 0x8000))) tileNum += 0x10;
+    }
+    if (ppu->mode == 0) paletteNum += 8 * layer;
+
+    int row = (tile & 0x8000) ? 7 - (y & 7) : (y & 7);
+    bool hFlip = (tile & 0x4000) != 0;
+    int paletteOffset = paletteSize * paletteNum;
+
+    uint32_t tcKey = (uint32_t)(tile & 0x5fff)
+                   | ((uint32_t)(row & 7) << 16)
+                   | tcLayerBits;
+    uint32_t tcHash = (tcKey ^ (tcKey >> 16)) & 0xff;
+    bool tcHit = (ppu->tileCacheKey[tcHash] == tcKey
+               && ppu->tileCacheEpochStamp[tcHash] == ppu->tileCacheEpoch);
+
+    if (tcHit) {
+      const uint8_t *src = ppu->tileCacheData[tcHash];
+      if (!windowed) {
+        for (int pi = 0; pi < 8; pi++) {
+          int ox = outX + pi;
+          if (ox < 0) continue;
+          if (ox >= 256) break;
+          uint8_t p = src[pi];
+          if (p != 0) out[ox] = cg[p];
+        }
+      } else {
+        for (int pi = 0; pi < 8; pi++) {
+          int ox = outX + pi;
+          if (ox < 0) continue;
+          if (ox >= 256) break;
+          uint8_t p = src[pi];
+          if (p != 0 && !winMask[ox]) out[ox] = cg[p];
+        }
+      }
+    } else {
+      uint8_t *cache = ppu->tileCacheData[tcHash];
+      uint16_t plane1, plane2 = 0, plane3 = 0, plane4 = 0;
+      int basePl = (tileAdrBase + ((tileNum & 0x3ff) * 4 * bitDepth) + row) & 0x7fff;
+      plane1 = ppu->vram[basePl];
+      if (bitDepth > 2) plane2 = ppu->vram[(basePl + 8) & 0x7fff];
+      if (bitDepth > 4) {
+        plane3 = ppu->vram[(basePl + 16) & 0x7fff];
+        plane4 = ppu->vram[(basePl + 24) & 0x7fff];
+      }
+      const uint8_t *e0 = ppu_bitExpandLut[plane1 & 0xff];
+      const uint8_t *e1 = ppu_bitExpandLut[plane1 >> 8];
+      const uint8_t *e2 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 & 0xff] : NULL;
+      const uint8_t *e3 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 >> 8]   : NULL;
+      const uint8_t *e4 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 & 0xff] : NULL;
+      const uint8_t *e5 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 >> 8]   : NULL;
+      const uint8_t *e6 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 & 0xff] : NULL;
+      const uint8_t *e7 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 >> 8]   : NULL;
+
+      for (int pi = 0; pi < 8; pi++) {
+        int ox = outX + pi;
+        int idx = hFlip ? (7 - pi) : pi;
+        int pixel = e0[idx] | (e1[idx] << 1);
+        if (bitDepth > 2) pixel |= (e2[idx] << 2) | (e3[idx] << 3);
+        if (bitDepth > 4) pixel |= (e4[idx] << 4) | (e5[idx] << 5)
+                                |  (e6[idx] << 6) | (e7[idx] << 7);
+        uint8_t out8 = pixel ? (uint8_t)(paletteOffset + pixel) : 0;
+        cache[pi] = out8;
+        if (ox >= 0 && ox < 256 && out8 != 0
+            && (!windowed || !winMask[ox])) {
+          out[ox] = cg[out8];
+        }
+      }
+      ppu->tileCacheKey[tcHash] = tcKey;
+      ppu->tileCacheEpochStamp[tcHash] = ppu->tileCacheEpoch;
+    }
+
+    outX += 8;
+    srcX += 8;
+  }
+}
+
 /* ThumbySNES per-line full-composite fast path.
  *
  * Walks the mode's layer-slot list bottom-up (lowest z-priority first)
@@ -663,6 +803,10 @@ static void ppu_buildWindowMask(Ppu* ppu, int layer, uint8_t *mask) {
  * inner loops are tight branch-predictable array operations with no
  * per-pixel function calls. Produces a fully composited 256-pixel
  * RGB565 line in `out` in one pass.
+ *
+ * BG fast path is tile-major (Lever 3): walk the tilemap for each
+ * slot, decode + emit direct to `out` (cached via #27). No bgLine
+ * intermediate write / read.
  *
  * Mode 7 / mosaic / hires (5/6) / OPT (2/4/6) BG layers land in the
  * slow per-x fallback below. The common mode-1/3/4 games land in the
@@ -703,23 +847,12 @@ static void ppu_composeLineRgb565(Ppu* ppu, int y, uint16_t *out) {
     if (windowed) ppu_buildWindowMask(ppu, L, winMask);
 
     if (L < 4 && ppu->bgLineCacheValid[L]) {
-      /* Skip entirely if this (layer, priority) slot has no non-zero
-       * pixels on this line — common enough (empty BG3 etc.) to be
-       * worth the flag check. */
-      if (!ppu->bgLineNonEmpty[L][P ? 1 : 0]) continue;
-      /* BG fast path — 256-wide array of palette indices. */
-      const uint8_t *src = ppu->bgLine[L][P ? 1 : 0];
-      if (!windowed) {
-        for (int x = 0; x < 256; x++) {
-          uint8_t p = src[x];
-          if (p != 0) out[x] = cg[p];
-        }
-      } else {
-        for (int x = 0; x < 256; x++) {
-          uint8_t p = src[x];
-          if (p != 0 && !winMask[x]) out[x] = cg[p];
-        }
-      }
+      /* BG fast path — tile-major decode + emit direct to out[]
+       * (Lever 3). Walks the tilemap once per priority slot; the
+       * extra walk vs the old one-walk-two-priorities pattern is
+       * cheap thanks to the tile-row decode cache (#27). */
+      ppu_emitBgSlotRgb565(ppu, L, P ? true : false, y, out, cg,
+                           windowed, windowed ? winMask : NULL);
     } else if (L == 4) {
       /* Sprite slot: per-priority selection from pre-evaluated buffers. */
       const uint8_t *sp  = ppu->objPixelBuffer;
@@ -813,18 +946,21 @@ LAKESNES_HOT void ppu_runLine(Ppu* ppu, int line) {
   if(!ppu->forcedBlank) ppu_evaluateSprites(ppu, line - 1);
   // actual line
 
-  /* ThumbySNES: pre-render BG layers when the simple-case path is
-   * eligible. ppu_getPixel will sample the cache instead of decoding
-   * tiles per-pixel. */
+  /* ThumbySNES: BG pre-render is needed only for the legacy BGRX
+   * ppu_handlePixel path, which reads ppu->bgLine[L][P][x]. The new
+   * tile-major RGB565 fast path (Lever 3) decodes + emits inline
+   * inside ppu_emitBgSlotRgb565 and doesn't need the intermediate
+   * buffer. Skip the pre-render when the RGB565 callback is the
+   * active consumer. */
   bool simpleMode = (ppu->mode != 5 && ppu->mode != 6 && ppu->mode != 7
                      && ppu->mode != 2 && ppu->mode != 4);
+  bool usingRgb565 = (ppu->scanlineCbRgb565 != NULL);
   for (int L = 0; L < 4; L++) {
-    if (simpleMode && !ppu->bgLayer[L].mosaicEnabled) {
+    bool eligible = simpleMode && !ppu->bgLayer[L].mosaicEnabled;
+    if (eligible && !usingRgb565) {
       ppu_renderBgLine(ppu, L, line);
-      ppu->bgLineCacheValid[L] = 1;
-    } else {
-      ppu->bgLineCacheValid[L] = 0;
     }
+    ppu->bgLineCacheValid[L] = eligible ? 1 : 0;
   }
 
   if(ppu->mode == 7) ppu_calculateMode7Starts(ppu, line);

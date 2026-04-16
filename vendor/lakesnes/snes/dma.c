@@ -397,7 +397,7 @@ LAKESNES_HOT static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank
   }
 }
 
-LAKESNES_HOT void dma_handleDma(Dma* dma, int cpuCycles) {
+LAKESNES_HOT void dma_handleDmaSlow(Dma* dma, int cpuCycles) {
   // if hdma triggered, do it, except if dmastate indicates dma will be done now
   // (it will be done as part of the dma in that case)
   if(dma->hdmaInitRequested && dma->dmaState != 2) dma_initHdma(dma, true, cpuCycles);

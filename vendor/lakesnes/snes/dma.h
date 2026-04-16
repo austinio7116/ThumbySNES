@@ -45,8 +45,19 @@ void dma_reset(Dma* dma);
 void dma_handleState(Dma* dma, StateHandler* sh);
 uint8_t dma_read(Dma* dma, uint16_t adr); // 43x0-43xf
 void dma_write(Dma* dma, uint16_t adr, uint8_t val); // 43x0-43xf
-void dma_handleDma(Dma* dma, int cpuCycles);
+void dma_handleDmaSlow(Dma* dma, int cpuCycles);
 void dma_startDma(Dma* dma, uint8_t val, bool hdma);
 
+/* ThumbySNES fast-exit guard. dma_handleDma is called from every
+ * cpu read/write/idle (40-48M times/frame). For the overwhelming
+ * majority, nothing is pending and the function returns immediately
+ * after three flag checks. Inlining the fast-exit here kills the
+ * ~10% of core-0 frame time spent on the call+return overhead. */
+static inline void dma_handleDma(Dma* dma, int cpuCycles) {
+  if (dma->dmaState == 0
+      && !dma->hdmaInitRequested
+      && !dma->hdmaRunRequested) return;
+  dma_handleDmaSlow(dma, cpuCycles);
+}
 
 #endif

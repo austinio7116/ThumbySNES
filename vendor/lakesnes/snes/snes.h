@@ -99,12 +99,81 @@ void snes_runFrame(Snes* snes);
 // used by dma, cpu
 void snes_runCycles(Snes* snes, int cycles);
 
+/* ThumbySNES: inline fast path for the batched cycle scheduler.
+ * The slow `snes_runCycles` above walks event boundaries; the
+ * overwhelming majority of calls just need to advance hPos + cycles
+ * within a single "no event" region (between 16, 512, 1104, 1356,
+ * with no IRQ edge in window). Hoisting that case here kills the
+ * function-call overhead on ~90% of invocations.
+ *
+ * Fast path prerequisites:
+ *   1. hPos < 1356 (not in wrap territory)
+ *   2. hPos + cycles < next_event (no boundary crossed)
+ *   3. hPos does not cross 536 (DRAM-refresh +40 adjustment)
+ *   4. no hIrq edge in (hPos, hPos+cycles]
+ *
+ * When any prerequisite fails, fall through to the slow path. */
+static inline void snes_runCyclesFast(Snes* snes, int cycles) {
+  int hp = snes->hPos;
+  /* Events fire AT these hp values. If hp equals any, slow path
+   * must run the handler before advancing. */
+  if (hp == 0 || hp == 16 || hp == 512 || hp == 1104 || hp >= 1356) {
+    snes_runCycles(snes, cycles); return;
+  }
+  if (snes->hIrqEnabled && hp == snes->hTimer * 4) {
+    snes_runCycles(snes, cycles); return;
+  }
+  /* Next event strictly after hp. */
+  int next;
+  if      (hp <   16) next = 16;
+  else if (hp <  512) next = 512;
+  else if (hp < 1104) next = 1104;
+  else                next = 1356;
+  if (snes->hIrqEnabled) {
+    int irqHp = snes->hTimer * 4;
+    if (irqHp > hp && irqHp < next) next = irqHp;
+  }
+  if (hp + cycles >= next) { snes_runCycles(snes, cycles); return; }
+  if (hp < 536 && hp + cycles >= 536) { snes_runCycles(snes, cycles); return; }
+  /* Pure fast path — no event at hp, no event in (hp, hp+cycles). */
+  snes->cycles += cycles;
+  snes->hPos   += cycles;
+#if !(defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
+  /* Single-core builds (host): APU catch-up accumulator must tick
+   * with master cycles. Slow path does the same update per batched
+   * step. On dual-core (device) the SPC+DSP run free on core 1, so
+   * the accumulator is unused and this entire block compiles out. */
+  snes->apuCatchupCycles += (snes->palTiming
+      ? ((32040.0f * 32.0f) / (1364.0f * 312.0f * 50.0f))   /* PAL  ratio */
+      : ((32040.0f * 32.0f) / (1364.0f * 262.0f * 60.0f)))  /* NTSC ratio */
+      * (float)cycles;
+#endif
+  if (snes->autoJoyTimer > 0) {
+    snes->autoJoyTimer = (snes->autoJoyTimer > cycles)
+                       ? (uint16_t)(snes->autoJoyTimer - cycles)
+                       : 0;
+  }
+  /* IRQ condition update: same expression snes_runCycles uses at
+   * batch end. Needed because callers rely on irqCondition being
+   * in sync after this returns. */
+  bool condition = (
+    (snes->vIrqEnabled || snes->hIrqEnabled) &&
+    (snes->vPos == snes->vTimer || !snes->vIrqEnabled) &&
+    (snes->hPos == snes->hTimer * 4 || !snes->hIrqEnabled)
+  );
+  if (!snes->irqCondition && condition) {
+    snes->inIrq = true;
+    cpu_setIrq(snes->cpu, true);
+  }
+  snes->irqCondition = condition;
+}
+
 /* Flush accumulated cycles from the block-map fast path. Called once
  * per opcode from cpu_runOpcode. Declared in header for inlining in
  * cpu.c; also emitted as a real symbol in snes.c for cpu_asm.c. */
 static inline void snes_flushCycles(Snes* snes) {
   if (snes->pendingCycles > 0) {
-    snes_runCycles(snes, snes->pendingCycles);
+    snes_runCyclesFast(snes, snes->pendingCycles);
     snes->pendingCycles = 0;
   }
 }
