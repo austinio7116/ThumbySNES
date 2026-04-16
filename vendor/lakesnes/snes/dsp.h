@@ -82,7 +82,28 @@ struct Dsp {
   int16_t firBufferR[8];
   // sample ring buffer (1024 samples, *2 for stereo)
   int16_t sampleBuffer[0x400 * 2];
-  uint16_t sampleOffset; // current offset in samplebuffer
+  uint16_t sampleOffset;      // producer-side (DSP write) cursor
+  /* ThumbySNES: consumer-side (pull) cursor.
+   *
+   * Upstream dsp_getSamples always reads the LAST `wantedSamples`
+   * (534 NTSC / 641 PAL, i.e. 1/60 sec worth) from the ring. That
+   * assumes the caller pulls exactly once per emulated 60 Hz frame.
+   *
+   * On the Thumby Color we pull once per *rendered* frame, which
+   * can be 7-25 fps when emulation is slow — between pulls the DSP
+   * produces 1500-3000 samples but the original code only looks at
+   * 534 of them. The rest get overwritten in the ring. Each pull's
+   * resample ratio ends up different depending on how long the
+   * previous frame took, which is exactly the "speeding up and
+   * slowing down" audio wobble.
+   *
+   * `lastReadOffset` records where the consumer left off so
+   * dsp_getSamples can resample the range [lastReadOffset,
+   * sampleOffset] — the samples actually produced since the last
+   * pull — into the caller's requested output length. Pitch stays
+   * correct at any emulation framerate; tempo just slows gracefully
+   * when SPC emulation is starved. */
+  uint16_t lastReadOffset;
 };
 
 Dsp* dsp_init(Apu* apu);

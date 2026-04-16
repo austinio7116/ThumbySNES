@@ -264,14 +264,23 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         s_blend_a_dev_y = -1;
         snes_run_frame();
 
-        /* Pull audio from DSP (core 1) → mono → PWM ring buffer. */
+        /* Pull audio from DSP (core 1) → mono → PWM ring buffer.
+         * At sub-60 fps emulation the interval between pulls can
+         * stretch past 100 ms wall. Fill the entire PWM ring (~185 ms
+         * at 22050 Hz) rather than capping at 1024 samples — keeps the
+         * buffer primed across the slow stretches between frames.
+         * dsp_getSamples tracks `lastReadOffset` so the resample
+         * covers the correct range (everything produced since the
+         * last pull) — pitch stays stable at any fps. */
         {
             int room = snes_audio_pwm_room();
-            int want = room < 1024 ? room : 1024;
+            int want = room;
+            if (want > 3072) want = 3072;   /* match ABUF size below */
             if (want > 0) {
-                static int16_t abuf[1024 * 2];
+                #define ABUF_STEREO 3072
+                static int16_t abuf[ABUF_STEREO * 2];
+                static int16_t mbuf[ABUF_STEREO];
                 snes_get_audio(abuf, want);
-                static int16_t mbuf[1024];
                 for (int i = 0; i < want; i++) {
                     int s = (int)abuf[i * 2] + (int)abuf[i * 2 + 1];
                     if (s > 32767) s = 32767;

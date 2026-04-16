@@ -136,6 +136,7 @@ void dsp_reset(Dsp* dsp) {
   memset(dsp->firBufferR, 0, sizeof(dsp->firBufferR));
   memset(dsp->sampleBuffer, 0, sizeof(dsp->sampleBuffer));
   dsp->sampleOffset = 0;
+  dsp->lastReadOffset = 0;
 }
 
 void dsp_handleState(Dsp* dsp, StateHandler* sh) {
@@ -583,13 +584,55 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
 }
 
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame) {
-  // resample from 534 / 641 samples per frame to wanted value
-  float wantedSamples = (dsp->apu->snes->palTiming ? 641.0 : 534.0);
-  double adder = wantedSamples / samplesPerFrame;
-  double location = dsp->sampleOffset - wantedSamples;
-  for(int i = 0; i < samplesPerFrame; i++) {
-    sampleData[i * 2] = dsp->sampleBuffer[(((int) location) & 0x3ff) * 2];
-    sampleData[i * 2 + 1] = dsp->sampleBuffer[(((int) location) & 0x3ff) * 2 + 1];
+  /* ThumbySNES: consume the range [lastReadOffset, sampleOffset] —
+   * samples produced since the previous pull — and resample it into
+   * `samplesPerFrame` output samples.
+   *
+   * This gives correct pitch at any emulation framerate:
+   *   - high fps (steady-state): avail ≈ 534 NTSC samples per pull,
+   *     resample ratio matches upstream's original behaviour.
+   *   - low fps: avail grows; resample ratio scales so the output
+   *     covers the full produced range without pitch drift.
+   *   - SPC starved on core 1: avail shrinks; output is stretched,
+   *     tempo slows gracefully (no wobble).
+   *
+   * The ring holds 0x400 (1024) stereo samples. If the producer has
+   * overrun the consumer by more than 0x3fc, clamp to the most recent
+   * 0x3fc and drop the older samples — lost audio but unavoidable
+   * when the caller is behind by more than the ring's depth. */
+  uint16_t now  = dsp->sampleOffset;
+  uint16_t last = dsp->lastReadOffset;
+  uint16_t avail = (uint16_t)(now - last);
+
+  if (avail == 0) {
+    /* Producer hasn't advanced since last pull (possible on very
+     * light frames or if SPC is stalled). Hold last sample so we
+     * don't inject a click. */
+    int idx = ((int)(now - 1)) & 0x3ff;
+    int16_t lastL = dsp->sampleBuffer[idx * 2];
+    int16_t lastR = dsp->sampleBuffer[idx * 2 + 1];
+    for (int i = 0; i < samplesPerFrame; i++) {
+      sampleData[i * 2]     = lastL;
+      sampleData[i * 2 + 1] = lastR;
+    }
+    return;
+  }
+
+  if (avail > 0x3fc) {
+    /* Consumer fell more than a ring-depth behind — the producer has
+     * already overwritten the oldest samples we would otherwise have
+     * read. Drop them and start from the oldest still-valid slot. */
+    avail = 0x3fc;
+    last  = (uint16_t)(now - avail);
+  }
+
+  double adder    = (double)avail / samplesPerFrame;
+  double location = (double)last;
+  for (int i = 0; i < samplesPerFrame; i++) {
+    int idx = ((int)location) & 0x3ff;
+    sampleData[i * 2]     = dsp->sampleBuffer[idx * 2];
+    sampleData[i * 2 + 1] = dsp->sampleBuffer[idx * 2 + 1];
     location += adder;
   }
+  dsp->lastReadOffset = now;
 }
