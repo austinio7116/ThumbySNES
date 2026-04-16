@@ -48,7 +48,19 @@ if(THUMBYSNES_LINK_CORE)
     )
 
     add_library(lakesnes_dev STATIC ${LAKESNES_CORE_SRC})
-    target_include_directories(lakesnes_dev PUBLIC ${LK_SRC} ${SNES_ROOT}/src)
+    # snes_apu_core1_loop needs time_us_64 for the wall-clock SPC
+    # throttle (Stage 2 audio fix). Include pico_time headers (and
+    # its transitive dependency headers) without linking the library
+    # — snesrun_device brings in the real implementation via
+    # pico_stdlib below.
+    target_include_directories(lakesnes_dev PUBLIC
+        ${LK_SRC} ${SNES_ROOT}/src
+        $<TARGET_PROPERTY:pico_time,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:hardware_timer,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:hardware_base,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:pico_base_headers,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:hardware_sync,INTERFACE_INCLUDE_DIRECTORIES>
+    )
     target_compile_definitions(lakesnes_dev PUBLIC
         THUMBYSNES_HAVE_CORE=1
         # LAKESNES_HOT macro → puts marked functions in .time_critical.snes

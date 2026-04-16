@@ -30,6 +30,13 @@
 #include "ppu.h"
 #include "cart.h"
 
+#if defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
+/* Device-only: wall-clock throttle for the SPC on core 1 — see
+ * snes_apu_core1_loop below. time_us_64 is the pico-sdk wall timer
+ * (works on either core of RP2350). */
+#include "pico/time.h"
+#endif
+
 extern uint8_t thumbysnes_cart_xip;
 
 static Snes      *s_snes = NULL;
@@ -256,20 +263,55 @@ void snes_set_scanline_cb_rgb565(void (*cb)(void*, int, const uint16_t*), void *
 
 /* Dual-core APU entry point. Core 1 calls this once at boot on the
  * device build; on host it's a no-op (host keeps the classic
- * snes_catchupApu path). Runs SPC opcodes at the M33's natural rate —
- * that's roughly real-time for the SPC's 1.024 MHz — while core 0
- * handles CPU + PPU + LCD. CPU-side snes_catchupApu is compiled to a
- * no-op on device so the bus hot path loses the per-access SPC
- * catchup overhead. */
+ * snes_catchupApu path). Runs SPC opcodes clocked against wall time —
+ * see the throttle below — while core 0 handles CPU + PPU + LCD.
+ * CPU-side snes_catchupApu is compiled to a no-op on device so the
+ * bus hot path loses the per-access SPC catchup overhead.
+ *
+ * Wall-clock throttle (Stage 2 audio fix).
+ * The SPC's emulated clock is 1.024 MHz. Core 1's *native* SPC rate
+ * on a 300 MHz M33 is ~20-30× real-time when no PPU work is pending
+ * — so the DSP sample ring (1024 slots) laps the consumer many
+ * times per pull. Each pull then reads only the latest 1024 samples
+ * and resamples them into the caller's requested output count; the
+ * resample ratio depends on wall time between pulls (= pwm_room)
+ * while the input window is fixed at 1024. Result: pitch wobbles
+ * as emulation framerate jitters.
+ *
+ * Fix: pace SPC opcode execution so apu->cycles grows at the real
+ * 1,025,280 cycles/sec APU clock (NTSC = PAL — the sample rate is
+ * 32,040 Hz on both). The DSP producer now runs at the same rate
+ * as a real SNES, the consumer always sees ~534 samples/frame at
+ * 60 fps (matching upstream's original design), and the resample
+ * ratio stays constant regardless of emulation framerate.
+ *
+ * When PPU work starves SPC (heavy scenes), the throttle simply
+ * doesn't fire and SPC runs as fast as the remaining core-1 budget
+ * allows. The DSP falls behind wall time; tempo slows gracefully.
+ * But the resample ratio between pulls stays consistent within
+ * each fps regime, so there's no wobble — just tempo change.
+ *
+ * time_us_64 + apu->cycles reference is captured the first time
+ * s_apu_core1_snes becomes non-NULL after a null (new ROM load or
+ * first boot). Resets when s_apu_core1_snes returns to NULL so the
+ * next ROM starts with a fresh clock. */
 void snes_apu_core1_loop(void)
 {
 #if defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
+    uint64_t wall_ref_us    = 0;
+    uint32_t cycles_ref     = 0;
+    bool     have_ref       = false;
+
     for (;;) {
         Snes *s = s_apu_core1_snes;
         if (!s) {
+            /* Game unloaded — reset reference so the next load starts
+             * with a fresh wall-clock baseline. */
+            have_ref = false;
             __asm__ volatile ("nop");
             continue;
         }
+
         /* PPU-CPU pipeline: if core 0 dispatched a PPU line, render
          * it here. This is the pipeline overlap — core 0 is running
          * CPU for the next line while we render this one. */
@@ -283,9 +325,29 @@ void snes_apu_core1_loop(void)
              * to the LCD framebuffer) is sequenced before these flag
              * writes by program order. */
         }
-        /* SPC opcode: run one between PPU dispatches. Core 1 time-
-         * shares between PPU and SPC this way — SPC gets ~60-80% of
-         * core 1's budget (all the time between PPU renders). */
+
+        /* Wall-clock throttle: cap SPC execution rate at the real APU
+         * clock (1,025,280 cycles/sec). If apu->cycles is ahead of
+         * the wall-time target, idle this iteration so the DSP ring
+         * isn't over-produced. The PPU check above still runs every
+         * iteration so rendering latency isn't affected. */
+        if (!have_ref) {
+            wall_ref_us = time_us_64();
+            cycles_ref  = (uint32_t)s->apu->cycles;
+            have_ref    = true;
+        }
+        uint64_t wall_elapsed = time_us_64() - wall_ref_us;
+        /* 1,025,280 cycles per 1e6 us: multiply first (uint64) then
+         * divide to keep precision. Safe up to 17 million seconds. */
+        uint32_t cycles_target = cycles_ref
+            + (uint32_t)(wall_elapsed * 1025280ULL / 1000000ULL);
+        int32_t  ahead_by = (int32_t)((uint32_t)s->apu->cycles - cycles_target);
+        if (ahead_by > 0) {
+            /* SPC is ahead of wall clock — idle. The PPU dispatch path
+             * above still ran this iteration so LCD latency is fine. */
+            __asm__ volatile ("nop");
+            continue;
+        }
         spc_runOpcode(s->apu->spc);
     }
 #else
