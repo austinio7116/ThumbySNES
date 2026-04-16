@@ -255,6 +255,52 @@ scheduler) at ~20%. Three matched levers landed:
     active; the legacy BGRX path still populates `bgLine[L][P]`
     via `ppu_renderBgLine` for backward compatibility.
 
+## Audio quality fixes (not perf, but related)
+
+These don't change fps; they fix audio quality issues caused by
+the mismatch between emulated fps and wall time. Listed here
+because they're part of the same dual-core architecture and the
+symptoms look like perf bugs (audio pitch drifting).
+
+34. **DSP read-cursor tracking** (`dsp.h` + `dsp.c`). Upstream
+    `dsp_getSamples` always reads the LAST 534 NTSC (641 PAL)
+    samples from the 1024-slot ring, assuming one pull per
+    emulated 60 Hz frame. At 7-25 fps emulation the caller pulls
+    every 40-140 ms wall — between pulls the DSP writes
+    1500-4500 samples but only 534 get read, rest overwritten.
+    Each pull's resample ratio depends on the variable pwm_room
+    (wall-time-dependent) / fixed 534 input → pitch wobbles with
+    fps jitter. Fix: new `uint16_t lastReadOffset` tracks where
+    the consumer left off; `dsp_getSamples` resamples the range
+    actually produced `[lastReadOffset, sampleOffset]` into the
+    caller's requested output count. Clamps to most-recent 1020
+    samples if the producer has lapped us, holds last sample on
+    empty (no click). Device push (`device/snes_run.c`) raised
+    from 1024-sample cap to 3072 so the PWM ring (4096 slots,
+    ~185 ms) stays primed between pulls.
+
+35. **Wall-clock throttle SPC on core 1** (`src/snes_core.c`,
+    `snes_apu_core1_loop`). L34 alone still wobbled: the producer
+    (SPC on core 1) ran at core 1's native rate, roughly 20-30×
+    real-time when PPU had slack, lapping the DSP ring many
+    times per pull. The clamp in L34 then always read "most
+    recent 1020 samples" = fixed input window, variable output
+    window → ratio still wobbled.
+    Fix: pace `apu->cycles` growth against `time_us_64()` so
+    SPC executes at the real 1,025,280 APU cycles/sec. When
+    `apu->cycles > cycles_ref + wall_elapsed_us * 1025280 / 1e6`,
+    the loop idles; otherwise `spc_runOpcode` runs.
+    Reference captured on ROM load (`s_apu_core1_snes` going
+    null → non-null) and reset on unload. When PPU starves SPC
+    (heavy scenes), the throttle simply doesn't fire and SPC
+    runs flat-out — audio tempo slows gracefully but pitch
+    stays correct because the resample ratio tracks actual
+    production rate consistently. Requires `pico_time` headers
+    exposed to `lakesnes_dev` via
+    `INTERFACE_INCLUDE_DIRECTORIES` (linking the library would
+    pull in its .c files which won't compile without
+    `pico_sdk_init`).
+
 ### Post-session numbers (host, 900 frames, 3-run mean, --xip)
 
 | Scene (ROM, content)               | Pre-31-33 | Post-31-33 | Δ     |

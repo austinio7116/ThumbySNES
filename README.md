@@ -96,7 +96,7 @@ flowchart LR
 
   subgraph Core1["Core 1 — audio + PPU"]
     direction TB
-    SPC["SPC700 + DSP loop<br/>(spc.c + dsp.c)"]
+    SPC["SPC700 + DSP<br/>(spc.c + dsp.c)<br/>wall-clock throttled"]
     PPU["ppu_runLine<br/>on s_ppu_pipeline_line"]
     Blend["2x2 RGB565 blend<br/>on_scanline_565"]
   end
@@ -157,11 +157,11 @@ sequenceDiagram
     C1->>C0: s_ppu_pipeline_done = 1
   end
 
-  Note over C0,C1: Concurrently — SPC + DSP always running on core 1
-  C1->>C1: spc_runOpcode loop
-  Note over C0: at vblank
-  C0->>C1: (no-op — inPorts/outPorts byte-atomic)
-  C1->>C0: dsp_getSamples → stereo → mono → PWM ring
+  Note over C0,C1: Concurrently — SPC + DSP on core 1, wall-clock throttled
+  C1->>C1: time_us_64 check — SPC ahead of wall? idle.
+  C1->>C1: spc_runOpcode (paced to real 1.024 MHz APU clock)
+  Note over C0: once per emulated frame
+  C1->>C0: dsp_getSamples (lastReadOffset-cursor resample) → mono → PWM ring
 ```
 
 Core 0 waits on `s_ppu_pipeline_done` before dispatching the *next*
@@ -312,7 +312,7 @@ tracked them down without a JTAG probe.
 | PPU → CPU completion | C1 → C0 | `s_ppu_pipeline_done` write | C0 spin-waits before next dispatch |
 | CPU → SPC register | C0 → C1 | `snes->apu->inPorts[4]` | byte-atomic, no mailbox |
 | SPC → CPU register | C1 → C0 | `snes->apu->outPorts[4]` | byte-atomic, no mailbox |
-| DSP → CPU audio | C1 → C0 | DSP sample ring + `lastReadOffset` | pulled once per frame |
+| DSP → CPU audio | C1 → C0 | 1024-slot DSP sample ring, `lastReadOffset` cursor | pulled once per emulated frame; producer throttled to wall clock |
 | CPU VRAM writes | C0 → (shared) | direct `ppu->vram[]` write | no sync — games avoid mid-render writes |
 
 ## Performance
@@ -737,14 +737,66 @@ a regression appears.
 
 ## Audio
 
-`dsp_getSamples` in dual-core mode tracks a moving read cursor
-(`lastReadOffset`) over the SPC sample ring. Each call resamples
-exactly the samples produced since the last call — so emulator
-framerates below 60 fps no longer compress one frame's worth of audio
-into too few output samples. Audio plays at correct realtime pitch at
-any framerate. The single-core code path is unaffected (delta is
-always one frame's worth, matching the original 534/641-sample
-behaviour).
+The audio pipeline has three moving parts across both cores:
+
+```
+Core 1                         Core 0                     PWM DMA
+─────────                      ─────────                  ─────────
+ SPC700 + DSP ─► sampleBuffer   snes_get_audio            snes_audio_pwm
+ (wall-clock    (1024 slots,    (once per emulated         ring (4096),
+  throttled)     stereo)          frame)                   drain @ 22050 Hz
+               │                │                         │
+ sampleOffset++│                │                         │
+               ▼                ▼                         ▼
+           [producer]      [resample 32040→             [9-bit DAC
+                            N output, via                output on GP23]
+                            lastReadOffset]
+```
+
+**Producer — core 1.** `snes_apu_core1_loop` (`src/snes_core.c`) runs
+`spc_runOpcode` in a tight loop, interleaved with PPU line renders.
+The SPC's emulated clock is 1.024 MHz (= 32,040 samples/sec × 32 APU
+cycles/sample, same NTSC and PAL). Without throttling, core 1's
+native SPC rate is ~20–30× real-time whenever PPU has slack — which
+laps the 1024-slot sample ring many times per pull and causes the
+consumer's resample ratio to wobble with emulation framerate.
+
+The loop throttles against `time_us_64()`:
+
+```c
+cycles_target = cycles_ref + wall_elapsed_us * 1025280 / 1e6;
+if (apu->cycles > cycles_target) idle;   // SPC ahead — pause
+else spc_runOpcode(spc);                  // catch up
+```
+
+`wall_ref_us` / `cycles_ref` are captured when a ROM loads and reset
+on unload. When PPU work starves SPC (heavy scenes), the throttle
+simply doesn't fire and SPC runs flat-out at whatever core 1 can
+manage — music tempo slows gracefully but pitch stays correct
+because the resample ratio is driven by actual production rate.
+
+**Consumer — core 0, per emulated frame.** `snes_get_audio` calls
+`dsp_getSamples`, which now tracks a `lastReadOffset` cursor on the
+ring. Each call resamples the range `[lastReadOffset, sampleOffset]`
+— the samples actually produced since the previous pull — into
+however many output samples the caller asked for. If the producer
+has lapped the ring (> 1020 samples unread), we clamp to the most
+recent 1020 and drop the older ones; if the producer hasn't advanced
+at all (SPC stalled), we hold the last sample to avoid a click.
+
+**Output — PWM DMA, 22050 Hz wall.** `device/snes_audio_pwm.c` runs
+a 9-bit PWM carrier on GP23 with a timer IRQ at 22050 Hz that pulls
+one sample per firing from a 4096-slot ring and writes the duty
+cycle. Ring depth ≈ 185 ms at the output rate, which smooths over
+the per-frame pull cadence. The push loop in `device/snes_run.c`
+refills up to 3072 slots per pull so the ring stays primed even at
+sub-10 fps emulation.
+
+**Single-core (host) build.** None of the throttle logic applies —
+host keeps the classic `snes_catchupApu` per-access path where CPU
+progress drives SPC cycles. `dsp_getSamples`'s cursor-tracked
+resample still works there and behaves identically to the original
+per-frame `wantedSamples=534` flow at steady 60 fps.
 
 ## License
 

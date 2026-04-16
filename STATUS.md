@@ -40,7 +40,7 @@
 | FFII first gameplay scene | ~7.2 | Heavy: full BG + sprites + DMA |
 | Zelda ALTTP title/load | ~16-20 | Medium |
 
-Audio wired end-to-end (DSP → stereo fold → PWM). Plays at correct pitch, rhythm proportionally slower at sub-60 fps. No stuttering.
+Audio wired end-to-end (DSP → stereo fold → PWM). SPC on core 1 is wall-clock-throttled against `time_us_64()` so production rate matches the real 1.024 MHz APU clock regardless of emulation framerate. `dsp_getSamples` tracks a `lastReadOffset` cursor and resamples the range actually produced between pulls. Pitch stays correct at any fps; tempo slows gracefully when heavy scenes starve SPC of core-1 cycles. See `README.md` → Audio section.
 
 All buttons working (TBY_BTN_* namespace fix). LB+RB chord = Start / exit for broken MENU buttons.
 
