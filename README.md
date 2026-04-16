@@ -61,31 +61,259 @@ suppressed — so audio pitch and game logic are unaffected.
 
 A small FPS counter sits in the top-left corner of every game.
 
-## Architecture notes
+## Architecture
 
-- **Dispatch**: `cpu_runBatchAsm` (`src/cpu_asm.c`) runs 64 opcodes per
-  call as a single Thumb-2 routine in flash. Pinned ARM registers:
+### System view
 
-  ```
-  R4  = A          R5  = X          R6  = Y         R7  = SP
-  R8  = PC         R9  = packed P   R10 = Cpu*      R11 = Snes*
-  ```
+Both M33 cores run concurrently out of a shared 520 KB SRAM. Hot
+functions are pinned into `.time_critical.*` sections that the Pico
+SDK copies from flash into SRAM at boot. ROMs are mmap'd from flash
+XIP — zero-copy, addressed directly by the `cart_read` mapper.
 
-  Helpers (`.Lrd`, `.Lwr`, `.Lidl`, `.Lfetch`, `.Lzn8`, `.Lzn16`,
-  `.Lint`, …) preserve `r4-r11`, save LR through the `FLR` stack slot,
-  and call back into the C-side `snes_cpuRead` / `snes_cpuWrite` /
-  `snes_cpuIdle` handlers via function-pointer slots in the dispatch
-  frame.
+```mermaid
+flowchart LR
+  subgraph Flash["Flash (16 MB, XIP)"]
+    direction TB
+    FW["firmware<br/>.text / .rodata"]
+    FS["FatFs filesystem<br/>(games, saves)"]
+    ROMS["ROM data<br/>(addressed directly)"]
+  end
 
-- **PPU on core 1**: `s_ppu_pipeline_line` / `s_ppu_pipeline_done`
-  hand off scanline rendering. Core 0 dispatches a line at hPos=512 and
-  continues running the CPU; core 1 composites and pushes to LCD. The
-  scanline blend callback (`on_scanline_565`) does a 2×2 RGB565 average
-  with horizontal-crop FILL.
+  subgraph SRAM["SRAM (520 KB)"]
+    direction TB
+    HOTC[".time_critical.snes*<br/>(hot code + bit-lane LUT)<br/>~29 KB"]
+    HEAP["Heap (~297 KB)<br/>Snes / Apu / Ppu structs<br/>+ cart SRAM"]
+    BSS["BSS (~190 KB)<br/>drivers, picker, SDK"]
+  end
 
-- **SPC700 + DSP on core 1**: free-running, sample-driven. Core 0 pulls
-  resampled stereo from `dsp_getSamples` once per emulated frame and
-  pushes mono into the PWM ring at 22050 Hz.
+  subgraph Core0["Core 0 — CPU side"]
+    direction TB
+    Run["snes_run_frame loop<br/>(device/snes_run.c)"]
+    ASM["cpu_runBatchAsm<br/>(src/cpu_asm.c)"]
+    Bus["bus / DMA / scheduler<br/>(snes.c, dma.c)"]
+    LCD["LCD SPI DMA push<br/>(snes_lcd_gc9107.c)"]
+  end
+
+  subgraph Core1["Core 1 — audio + PPU"]
+    direction TB
+    SPC["SPC700 + DSP loop<br/>(spc.c + dsp.c)"]
+    PPU["ppu_runLine<br/>on s_ppu_pipeline_line"]
+    Blend["2x2 RGB565 blend<br/>on_scanline_565"]
+  end
+
+  subgraph IO["I/O"]
+    direction TB
+    LCDDev["128×128 RGB565<br/>GC9107 LCD"]
+    PWMdev["PWM mono audio<br/>22050 Hz"]
+    BTNs["A B LB RB D-pad<br/>MENU"]
+    USBdev["USB (runtime MSC)"]
+  end
+
+  ROMS -->|readMap ptr| Bus
+  Run --> ASM
+  ASM <--> Bus
+  Bus -->|hPos=512| PPU
+  Bus <-->|inPorts / outPorts<br/>byte-atomic| SPC
+  PPU --> Blend
+  Blend --> LCD
+  LCD --> LCDDev
+  SPC -->|sample ring| Run
+  Run --> PWMdev
+  BTNs --> Run
+  USBdev <--> Run
+```
+
+### Per-frame execution — the dual-core pipeline
+
+The central cleverness is that ppu_runLine isn't in the CPU's
+critical path. Core 0 runs 65816 opcodes until hPos=512 of each
+scanline, then *dispatches* the line to core 1 and keeps running
+CPU. Core 1 composites the line and blits to the LCD framebuffer in
+parallel. The hand-off is a pair of `volatile int` flags
+(`s_ppu_pipeline_line` / `s_ppu_pipeline_done`) — no mutex, no DMA
+channel, atomic 32-bit writes on M33.
+
+```mermaid
+sequenceDiagram
+  participant C0 as Core 0 (CPU)
+  participant C1 as Core 1 (PPU + SPC)
+  participant LCD as LCD FB
+
+  Note over C0: snes_run_frame
+  loop every 2 master cycles
+    C0->>C0: cpu_runBatchAsm (64 opcodes)
+    C0->>C0: snes_runCycles (batched to next event)
+  end
+  Note over C0,C1: hPos == 512 of line N
+  C0->>C1: s_ppu_pipeline_line = N (dispatch)
+  par core 0 keeps CPU running
+    C0->>C0: CPU opcodes (line N+1 prologue)
+  and core 1 composes line N
+    C1->>C1: sprite eval
+    C1->>C1: per-layer BG render (+tile cache hits)
+    C1->>C1: RGB565 per-line composite
+    C1->>C1: 7:4 horiz crop + 2x2 blend
+    C1->>LCD: write row into framebuffer
+    C1->>C0: s_ppu_pipeline_done = 1
+  end
+
+  Note over C0,C1: Concurrently — SPC + DSP always running on core 1
+  C1->>C1: spc_runOpcode loop
+  Note over C0: at vblank
+  C0->>C1: (no-op — inPorts/outPorts byte-atomic)
+  C1->>C0: dsp_getSamples → stereo → mono → PWM ring
+```
+
+Core 0 waits on `s_ppu_pipeline_done` before dispatching the *next*
+line (`while (!done) { }`) — so the pipeline's critical path is
+`max(cpu_line_work, ppu_line_work)`. Today they're roughly balanced
+(core 1 slightly heavier due to the PPU composite).
+
+### Memory layout
+
+```
+Flash (16 MB, XIP)                     SRAM (520 KB)
+──────────────────────                 ─────────────────────────
+┌──────────────────┐  0x10000000       ┌──────────────────┐  0x20000000
+│ bootloader + SDK │                   │ ram_vector_table │
+├──────────────────┤                   ├──────────────────┤
+│ .text / .rodata  │                   │ .data (hot code) │
+│ (cold code)      │                   │ .time_critical.* │
+│                  │                   │  — cpu_runBatch  │
+├──────────────────┤                   │  — ppu_runLine   │
+│ FatFs image      │                   │  — snes_runCycle │
+│ (USB-MSC mount)  │                   │  — bit-lane LUT  │
+│  ├─ test_cpu.sfc │                   ├──────────────────┤
+│  ├─ FFII.sfc     │                   │ BSS              │
+│  ├─ Zelda.sfc ...│◄────┐             │  — LakeSnes stat │
+│                  │     │ readMap[]   │  — drivers       │
+└──────────────────┘     │ direct ptr  │  — picker bufs   │
+                         └──────────────┤                  │
+                                        ├──────────────────┤
+                                        │ heap (~297 KB)   │
+                                        │  Snes struct    │
+                                        │   └─ WRAM 128 K │
+                                        │  Apu struct     │
+                                        │   └─ ARAM  64 K │
+                                        │  Ppu struct     │
+                                        │   ├─ VRAM  64 K │
+                                        │   ├─ bgLine 2 K │
+                                        │   └─ tile cache │
+                                        │      4 K (#27)  │
+                                        │  Cart RAM 0-64 K│
+                                        ├──────────────────┤
+                                        │ stack            │
+                                        └──────────────────┘
+```
+
+Runtime heap demand ≈ 265 KB on a typical 2 KB SRAM game (SMW,
+Zelda), 297 KB on a Star Fox-class 64 KB-SRAM game. Headroom is
+~30 KB — tight but comfortable.
+
+### CPU bus — block-map fast path
+
+The 24-bit SNES address space is divided into 4096 × 4 KB blocks.
+Each `readMap[block]` is either a direct pointer (WRAM / mapped ROM)
+or the sentinel `SNES_MAP_SPECIAL` (registers, DMA, APU ports,
+unmapped). This replaces the 6-8 cascading if-checks in LakeSnes's
+`snes_rread` with one array lookup for the ~95% of reads that hit
+plain memory.
+
+```
+cpu wants byte at SNES adr (24-bit)
+        │
+        ▼
+  block = (adr >> 12) & 4095
+  ptr   = snes->readMap[block]
+        │
+        ├── ptr  <  SNES_MAP_LAST ──► slow path (snes_rread, switch)
+        │                              │ PPU $2100-$213f
+        │                              │ APU $2140-$217f
+        │                              │ input $4016/$4017
+        │                              │ regs  $4200-$421f
+        │                              │ DMA   $4300-$437f
+        │                              │ cart SRAM / open bus
+        │
+        └── ptr >= SNES_MAP_LAST  ──► fast path (WRAM / ROM direct)
+                                       │ speed = readMapSpeed[block]
+                                       │ dma_handleDma(speed)
+                                       │ pendingCycles += speed
+                                       │ return ptr[adr & 0xfff]
+                                       │
+                                       └── ~4 ARM instructions for
+                                           the overwhelmingly common
+                                           path: ROM fetch for the
+                                           next opcode / operand.
+```
+
+Cycle bookkeeping rides along: the fast path accumulates into
+`pendingCycles` and flushes once per opcode in `cpu_runOpcode` via
+`snes_flushCycles`. That reduces `snes_runCycles` calls from ~1.8M
+to ~600K per frame.
+
+### CPU dispatcher — ARM Thumb-2 asm
+
+The 65816 core is 256 opcode handlers in a single naked function in
+`src/cpu_asm.c`, run 64 opcodes per call as `cpu_runBatchAsm`.
+Across opcodes we keep the 65816 registers pinned in ARM callee-saved
+regs, only spilling when a bus-access helper needs to call back into C:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ cpu_runBatchAsm(cpu, 64)                                 │
+│                                                          │
+│ prologue:                                                │
+│   push  {r4-r11, lr}                                     │
+│   sub   sp, #FSZ            ; scratch frame (80 B)       │
+│   ldm   r0, {r4-r11}        ; load A, X, Y, SP, PC, P,   │
+│                             ; Cpu*, Snes* from struct    │
+│                                                          │
+│ ┌──────────────────────────────────────────────────┐     │
+│ │ Dispatch loop (64 iterations)                    │     │
+│ │                                                  │     │
+│ │   bl    .Lfetch              ; r0 = next opcode  │     │
+│ │   tbb   [pc, r0]             ; jump table        │     │
+│ │                                                  │     │
+│ │   → opcode handler (200-3000 byte routine) ─┐    │     │
+│ │     · keeps state in r4-r11                 │    │     │
+│ │     · calls .Lrd / .Lwr / .Lidl for bus     │    │     │
+│ │     · updates flags in r9 (packed P)        │    │     │
+│ │   ◄────────────────────────────────────────┘     │     │
+│ │                                                  │     │
+│ │   subs  r12, #1; bne dispatch                    │     │
+│ └──────────────────────────────────────────────────┘     │
+│                                                          │
+│ epilogue:                                                │
+│   stm   r0, {r4-r11}        ; write back to Cpu struct   │
+│   add   sp, #FSZ                                         │
+│   pop   {r4-r11, pc}                                     │
+└──────────────────────────────────────────────────────────┘
+
+Register pinning:                  Bus helpers preserve:
+  R4  = 65816 A                      r4-r11 (AAPCS callee-saved)
+  R5  = 65816 X                      SR0 (caller's r0 scratch)
+  R6  = 65816 Y                      FLR (saved LR slot)
+  R7  = 65816 SP
+  R8  = 65816 PC                   Call-outs to C:
+  R9  = packed P flags               snes_cpuRead(mem, adr)
+  R10 = Cpu*                         snes_cpuWrite(mem, adr, v)
+  R11 = Snes*                        snes_cpuIdle(mem, waiting)
+```
+
+See the [ASM dispatcher debugging history](#asm-dispatcher-debugging-history-april-2026)
+section below for the two bugs this merge uncovered and how we
+tracked them down without a JTAG probe.
+
+### Cross-core interactions
+
+| Channel | Direction | Mechanism | Synchronisation |
+|---|---|---|---|
+| CPU → PPU dispatch | C0 → C1 | `s_ppu_pipeline_line` write | `s_ppu_pipeline_done` spin |
+| PPU → CPU completion | C1 → C0 | `s_ppu_pipeline_done` write | C0 spin-waits before next dispatch |
+| CPU → SPC register | C0 → C1 | `snes->apu->inPorts[4]` | byte-atomic, no mailbox |
+| SPC → CPU register | C1 → C0 | `snes->apu->outPorts[4]` | byte-atomic, no mailbox |
+| DSP → CPU audio | C1 → C0 | DSP sample ring + `lastReadOffset` | pulled once per frame |
+| CPU VRAM writes | C0 → (shared) | direct `ppu->vram[]` write | no sync — games avoid mid-render writes |
 
 ## Performance
 
