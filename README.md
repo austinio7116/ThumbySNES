@@ -12,6 +12,14 @@ machine running in `time_critical.snes` flash; PPU/SPC/DSP run on the
 second core; LCD output is a per-line 2×2 RGB565 blend with horizontal
 crop ("FILL" mode).
 
+> **tl;dr** — a 520 KB MCU at 300 MHz running SNES ROMs at 7–25 fps.
+> Got there by rewriting the 65816 dispatcher in hand-rolled Thumb-2
+> asm, pinning hot paths to SRAM, building a block-map bus, splitting
+> PPU / SPC / DSP across both cores, collapsing the per-pixel composite
+> into per-line RGB565, and squeezing every frame with a tile-row
+> decode cache + DMA fast path + bitmask-parallel blend. See the
+> [Performance](#performance) section below for the full catalog.
+
 ## Build
 
 ### Host (development / test ROM verification)
@@ -78,6 +86,201 @@ A small FPS counter sits in the top-left corner of every game.
 - **SPC700 + DSP on core 1**: free-running, sample-driven. Core 0 pulls
   resampled stereo from `dsp_getSamples` once per emulated frame and
   pushes mono into the PWM ring at 22050 Hz.
+
+## Performance
+
+Emulating a 21.48 MHz 65816 + 32.04 MHz SPC700 + 256×224 composited PPU
+at audio rate on a 300 MHz Cortex-M33 with 520 KB SRAM is, to put it
+mildly, a tight budget. We started at **~4.8 fps** on content scenes with
+vanilla LakeSnes. We're now at **~7 fps heavy gameplay / ~20-25 fps
+menus & light content** — a 2-5× improvement depending on scene. This
+section documents how.
+
+### Current results (device, 2026-04-14 baseline + 2026-04-16 additions)
+
+| Scene                         | FPS    | Notes                          |
+|-------------------------------|:------:|--------------------------------|
+| FFII flying intro             | ~20    | Light: 1 BG, few sprites       |
+| FFII menus                    | ~20-24 | Light-medium                   |
+| FFII first gameplay           | ~7-8   | Heavy: full BG + sprites + DMA |
+| Zelda ALTTP title/load        | ~16-20 | Medium                         |
+
+Host benchmark (`snesbench … --xip`, 900 frames × 3 reps, x86-64):
+
+| ROM                | Baseline | 2026-04-16 | Δ       |
+|--------------------|---------:|-----------:|--------:|
+| Zelda ALTTP        |  438 fps |    522 fps | **+19%** |
+| SMW                |  327 fps |    344 fps | +5%     |
+| FFII               |  534 fps |    555 fps | +4%     |
+| Super Metroid      |  520 fps |    527 fps | +1%     |
+| Chrono Trigger     |  679 fps |    664 fps | –2% (noise) |
+
+Device numbers for the 2026-04-16 session will show a larger relative
+gain than host because several of the additions only activate on
+device (LUT into SRAM, bitmask-parallel RGB565 blend).
+
+### The journey, chronologically
+
+The work split roughly into five passes:
+
+**Pass 1 — make it fit.** snes9x2002 was the obvious choice but its
+architecture carried a 4 MB graphics buffer — impossible on 520 KB
+SRAM even after aggressive reduction. Switched to LakeSnes (pure C,
+per-scanline native, ~6500 LOC) and patched its `pixelBuffer` from
+978 KB → 2 KB (one scanline), adding a scanline callback so the
+frontend could consume + downscale each line before the next one
+stomped it. **This single architectural choice is the only reason this
+emulator exists on this MCU.** Paired with a zero-copy XIP ROM loader
+(`cart_load` takes the caller's flash pointer; `snes_loadRom` skips
+its power-of-2 mirror malloc), so up to 4 MB ROMs live directly in
+flash — no SRAM copy, no mapper pre-processing.
+
+**Pass 2 — the cheap wins.** 300 MHz overclock, `LAKESNES_HOT` section
+markers pinning hot top-level functions into SRAM (dodges flash XIP
+cache misses on the inner loop), `double` → `float` for APU catch-up
+math (M33 has a single-precision FPU — doubles went through softfloat
+at ~50 cycles per op), `-O3 -ffunction-sections -fdata-sections
+-Wl,--gc-sections` for dead-strip. Reverted `-flto` (code bloat
+exceeded M33's 16 KB icache — slight regression). Also caught an
+upstream bug: `snes_catchupApu` casts the cycle accumulator to `int`
+before running SPC opcodes, permanently losing fractional cycles on
+tight CPU polls — this was the root cause of SMW hanging during its
+SPC handshake. Fixed by running while accumulator > 0.0f. (Still in
+the single-core fallback; no longer in the hot path on device thanks
+to Pass 5's dual-core split.)
+
+**Pass 3 — collapsing the per-pixel tax.** The profile showed
+`ppu_getPixel` consuming **47%** of frame time — it's called 224 × 256
+= ~57K times per frame, iterates 4-5 layer slots per pixel, and does a
+function-call-per-pixel window check inside the hot loop. This pass
+replaced that with:
+  - **Per-line BG layer cache** (`bgLine[layer][priority][x]`). Each
+    BG layer is decoded tile-by-tile into a 256-byte array once per
+    scanline, then read as array lookups during composite. Splits
+    hi/lo priority into separate buffers so the compositor jumps
+    straight to the right slot.
+  - **Tile-decode bit-lane LUT.** 256-entry byte→8-bit-lane expansion
+    table. Replaces each tile's 8 × {shift + AND + OR} inner loop with
+    pointer derefs + array reads. ~2× faster per 4bpp tile. Shared by
+    `ppu_renderBgLine` AND `ppu_evaluateSprites`.
+  - **Per-line empty-slot flag** (`bgLineNonEmpty[L][P]`). The
+    compositor skips full 256-wide passes for fully-transparent
+    slots — common (empty BG3 on outdoor scenes, BG2 on HUD-only
+    screens).
+  - **Per-line RGB565 full composite** (`ppu_composeLineRgb565`).
+    Walks the mode's layer-slot list once per line bottom-up, writing
+    RGB565 directly via the CGRAM cache (below). Replaces the per-pixel
+    `ppu_handlePixel` walk (8-12 slot iterations per pixel with
+    function-call-per-pixel window checks) with O(slots + pixels)
+    tight array passes. Hands a 256-pixel RGB565 line straight to the
+    frontend — no BGRX-bytes intermediate, no per-pixel channel math.
+  - **CGRAM → RGB565 LUT with brightness baked in.**
+    `cgramRgb565[256]`, lazy rebuild on `$2100`/`$2121`/`$2122` writes
+    via `cgramDirty` flag. Collapses the per-pixel 3-channel brightness
+    math + byte-pack into a single `uint16_t` array read.
+  - **`skipColorMath`.** Drops subscreen fetch + add/sub blending.
+    Loses SNES transparency / fade effects; cuts per-pixel work nearly
+    in half for games that used color math heavily.
+  - **`renderXStart` / `renderXEnd`.** With FILL-mode cropping 16 px
+    off each side of the 128×128 LCD, 32 pixels per line are invisible.
+    Skip them — 12% fewer per-pixel calls.
+
+Measured: Zelda 4.8 → 8 fps, FFII ≈5 → 9.6 fps.
+
+**Pass 4 — dual core.** The M33 is dual-core. Compile flag
+`THUMBYSNES_DUAL_CORE=1`:
+  - **Core 0**: 65816 CPU, bus, DMA, input, USB, LCD SPI DMA.
+  - **Core 1**: SPC700 + DSP, PPU scanline composite.
+  - `snes_catchupApu` becomes a no-op on dual-core builds; the
+    per-master-cycle `apuCatchupCycles` float accumulator update is
+    skipped (saves one FPU multiply + add per ~1-2M `snes_runCycle`
+    calls per frame).
+  - `inPorts`/`outPorts` between CPU and SPC are byte-atomic on M33 —
+    no mailbox, no spinlock, games' polling loops tolerate natural
+    cross-core latency.
+  - PPU scanline hand-off via `s_ppu_pipeline_line` /
+    `s_ppu_pipeline_done` at `hPos == 512`. Core 0 dispatches the
+    current line to core 1 and continues running CPU opcodes; core 1
+    composites the line and blits to the LCD framebuffer via the
+    RGB565 callback.
+
+**Pass 5 — ARM asm dispatcher.** The 65816 opcode dispatch loop was
+the remaining big lever. Wrote a 256-handler Thumb-2 dispatcher as a
+single naked function, 150 KB of source across `src/cpu_asm.c`, keeping
+the 65816 registers in callee-saved ARM regs (R4-R11) across a batch
+of opcodes. 64 opcodes per `cpu_runBatchAsm` call. Bus-access helpers
+(`.Lrd`, `.Lwr`, `.Lidl`, `.Lfetch`) preserve r4-r11 across BLX back
+into the C-side `snes_cpuRead` / `snes_cpuWrite` / `snes_cpuIdle`.
+Devirtualised those calls too (`THUMBYSNES_DIRECT_CPU_CALLS=1` — direct
+BL not indirect BLX through a function pointer). Block-based memory
+map (`snes->readMap`, 4096 × 4 KB blocks) resolves ~95% of reads in
+4 instructions. Per-opcode cycle accumulator (`snes->pendingCycles`)
+flushed once per opcode, reducing `snes_runCycles` calls from ~1.8M
+to ~600K per frame. The final merge uncovered two latent bugs that
+took a ROM-based bisection harness to debug — see [ASM dispatcher
+debugging history](#asm-dispatcher-debugging-history-april-2026)
+below for the war story.
+
+**Session 2026-04-16 — five more levers.** Closing sub-optimisations
+collected across the codebase audit:
+
+  - **DMA block-copy fast path** (`dma.c:340`). Detects the common
+    DMA tile-upload pattern — WRAM/ROM A-bus → PPU `$2118`/`$2119`,
+    remap mode 0 — and bypasses `snes_read` + `snes_writeBBus` +
+    `ppu_write` dispatch entirely. Goes straight through the readMap
+    block pointer and writes directly into `ppu->vram[]` preserving
+    openBus + vramPointer semantics. Remap modes 1-3 (rare) fall
+    through to the canonical slow path.
+  - **Persistent tile-row decode cache** (`ppu.c:314`). 256-entry
+    direct-mapped cache keyed on `{tile & 0x5fff, row, bitDepth,
+    tileAdrBase>>12}`. Each slot stores post-palette-offset bytes.
+    Epoch counter bumped on every VRAM byte-write gives zero-cost
+    invalidation — stale entries automatically miss. Miss path
+    **fuses** cache storage into the existing decode loop so miss
+    has ~zero extra cost; hit path skips the 8-iteration decode,
+    saving ~50 cycles per hit. Host: Zelda +19%, SMW +5%, Chrono
+    Trigger –2% (noise).
+  - **Per-slot window-mask precompute** (`ppu.c:565`). When a layer
+    slot is windowed, build a 256-byte mask once from the window
+    registers + combine logic, then index `winMask[x]` in the
+    per-pixel loop instead of calling `ppu_getWindowState` 256 times.
+    Helps games with windows (lantern halos, spell transitions).
+  - **Bit-lane LUT into SRAM** (`ppu.c:71`). The 2 KB byte→8-lane
+    table was in flash `.rodata` — each XIP cache miss was ~100
+    cycles and tile decode derefs it 4-8 times per tile. Section
+    attribute `.time_critical.snes_lut` copies it into SRAM at
+    boot. Device-only (host's x86 L1 already handles it).
+  - **Packed-32 RGB565 blend** (`device/snes_run.c:46`). The 2×2
+    blend in the scanline callback was 9 shifts + 3 ANDs + 3 adds
+    per call. Rewrote with the classic bit-mask-parallel-add trick
+    `((a ^ b) & 0xF7DE) >> 1 + (a & b)` — ~4 ARM ops — and added a
+    32-bit packed variant `rgb565_avg2_x2` that blends two RGB565
+    pairs per call, used by the vertical blend inner loop
+    (128 pixels → 64 pair-aligned iterations).
+
+See [`PERF.md`](PERF.md) for the full 30-item optimisation catalog
+with file:line references. [`STATUS.md`](STATUS.md) holds the current
+functional status, known bugs, and memory breakdown.
+
+### Why we can't easily reach 60 fps
+
+LakeSnes is a clean reference implementation focused on accuracy.
+Even after all the above, `ppu_handlePixel`-class work dominates the
+fallback paths (mosaic / mode 7 / hires / OPT). Getting meaningfully
+past 30 fps likely requires one of:
+
+1. **Tile-major PPU rewrite** — decode each tile once per scanline and
+   blit 8 pixels at a time, not pixel-at-a-time. Same architectural
+   choice snes9x2002 made for ARM handhelds. Estimated 3-5× speedup;
+   ~1-2 weeks of careful vendor surgery.
+2. **Inline WRAM path in top-4 ASM opcodes** — LDA/STA imm+abs+dp
+   hit `.Lrd`/`.Lwr` via BLX even for plain WRAM readMap hits.
+   Inlining that check saves ~6-8 cycles per opcode on ~25% of
+   executed ops. Estimated +1-2 fps. High complexity (careful ASM
+   register management).
+3. **Lower internal resolution** — render at 128×112 directly instead
+   of 256×224 + downscale. ~4× fewer pixels but requires teaching the
+   PPU half-resolution sampling. Major surgery.
 
 ## ASM dispatcher debugging history (April 2026)
 

@@ -337,7 +337,49 @@ static void dma_doHdma(Dma* dma, bool doSync, int cpuCycles) {
   if(doSync) snes_syncCycles(dma->snes, false, cpuCycles);
 }
 
-static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bool fromB) {
+LAKESNES_HOT static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bool fromB) {
+  Snes *snes = dma->snes;
+  /* ThumbySNES fast path: (W)RAM/ROM → PPU VRAM data ports ($2118/$19).
+   * This is the dominant DMA pattern — tile uploads via DMA mode 1 from
+   * a source in banks 7E/7F (WRAM) or 00-3F/80-FF (ROM/WRAM mirror).
+   * Bypasses the full snes_read + snes_writeBBus + ppu_write dispatch
+   * chain (~25 instructions) by going straight through the readMap
+   * pointer and writing directly to ppu->vram[], preserving:
+   *   - openBus side-effect (normal snes_read sets it),
+   *   - vramPointer increment semantics ($2118 advances on low-byte
+   *     write when vramIncrementOnHigh==0; $2119 on high-byte write
+   *     when ==1). Matches ppu_write case 0x18/0x19 exactly.
+   * Only runs when vramRemapMode == 0 (plain linear mapping — used by
+   * nearly every game). Remap modes 1-3 fall through to the slow
+   * path below. */
+  if (!fromB && (bAdr == 0x18 || bAdr == 0x19)
+      && snes->ppu->vramRemapMode == 0) {
+    uint32_t adr = ((uint32_t)aBank << 16) | aAdr;
+    uint32_t block = (adr >> SNES_MAP_SHIFT) & (SNES_MAP_BLOCKS - 1);
+    uint8_t *ptr = snes->readMap[block];
+    if (ptr >= SNES_MAP_LAST) {
+      /* A-bus is a direct WRAM/ROM pointer. readMap[block] is
+       * SNES_MAP_SPECIAL for register regions ($2100-$41ff in banks
+       * 00-3F/80-BF), so those correctly miss this fast path and fall
+       * through to the validA/validB-aware slow path below. */
+      Ppu *ppu = snes->ppu;
+      uint8_t val = ptr[adr & SNES_MAP_MASK];
+      snes->openBus = val;
+      uint16_t vramAdr = ppu->vramPointer & 0x7fff;
+      uint16_t cur = ppu->vram[vramAdr];
+      if (bAdr == 0x18) {
+        ppu->vram[vramAdr] = (cur & 0xff00) | val;
+        if (!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
+      } else {
+        ppu->vram[vramAdr] = (cur & 0x00ff) | ((uint16_t)val << 8);
+        if (ppu->vramIncrementOnHigh)  ppu->vramPointer += ppu->vramIncrement;
+      }
+      /* Bump tile-cache epoch — same as ppu_write($18/$19) would. */
+      ppu->tileCacheEpoch++;
+      return;
+    }
+  }
+
   // accessing 0x2180 via b-bus while a-bus accesses ram gives open bus
   bool validB = !(bAdr == 0x80 && (aBank == 0x7e || aBank == 0x7f || (
     (aBank < 0x40 || (aBank >= 0x80 && aBank < 0xc0)) && aAdr < 0x2000
@@ -347,11 +389,11 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
     aAdr == 0x420b || aAdr == 0x420c || (aAdr >= 0x4300 && aAdr < 0x4380) || (aAdr >= 0x2100 && aAdr < 0x2200)
   ));
   if(fromB) {
-    uint8_t val = validB ? snes_readBBus(dma->snes, bAdr) : dma->snes->openBus;
-    if(validA) snes_write(dma->snes, (aBank << 16) | aAdr, val);
+    uint8_t val = validB ? snes_readBBus(snes, bAdr) : snes->openBus;
+    if(validA) snes_write(snes, (aBank << 16) | aAdr, val);
   } else {
-    uint8_t val = validA ? snes_read(dma->snes, (aBank << 16) | aAdr) : dma->snes->openBus;
-    if(validB) snes_writeBBus(dma->snes, bAdr, val);
+    uint8_t val = validA ? snes_read(snes, (aBank << 16) | aAdr) : snes->openBus;
+    if(validB) snes_writeBBus(snes, bAdr, val);
   }
 }
 

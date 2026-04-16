@@ -43,15 +43,30 @@
 #define FILL_X_CROP 16
 #define FILL_SRC    224
 
+/* RGB565 2-sample average. Classic bit-mask-parallel-add trick:
+ *   avg = ((a ^ b) & 0xF7DE) >> 1 + (a & b)
+ * Mask 0xF7DE zeroes the LSB of each channel before the XOR-shift so
+ * the halving can't carry across channel boundaries; (a & b) adds
+ * back the LSB when both inputs carried one (so rounding is "either
+ * LSB set yields ≥ ½"). ~4 ARM instructions vs the ~12 of the
+ * straightforward extract-per-channel form. */
 static inline uint16_t rgb565_avg2(uint16_t a, uint16_t b) {
-    uint32_t rsum = ((a >> 11) & 0x1F) + ((b >> 11) & 0x1F);
-    uint32_t gsum = ((a >>  5) & 0x3F) + ((b >>  5) & 0x3F);
-    uint32_t bsum = (a & 0x1F) + (b & 0x1F);
-    return (uint16_t)(((rsum >> 1) << 11) | ((gsum >> 1) << 5) | (bsum >> 1));
+    return (uint16_t)((((uint32_t)(a ^ b) & 0xF7DEu) >> 1) + (a & b));
+}
+
+/* 32-bit vectorised variant: averages TWO RGB565 pairs packed into
+ * 32-bit words. The mask 0xF7DEF7DE applies the single-word trick to
+ * both halves in parallel, so four RGB565 pixels (two pair-blends)
+ * collapse to ~4 ARM instructions total. Used by the horizontal-blend
+ * inner loop when the 128-column output is produced in pairs. */
+static inline uint32_t rgb565_avg2_x2(uint32_t ab0, uint32_t ab1) {
+    return (((ab0 ^ ab1) & 0xF7DEF7DEu) >> 1) + (ab0 & ab1);
 }
 
 static uint16_t *s_lcd_target = NULL;
-static uint16_t  s_blend_a[FB_W];
+/* Aligned so the packed-32-bit blend path (rgb565_avg2_x2) can load
+ * pairs of pixels as uint32_t. FB_W=128 → 64 x2 iterations. */
+static uint16_t  s_blend_a[FB_W] __attribute__((aligned(4)));
 static int       s_blend_a_dev_y = -1;
 
 /* RGB565 scanline callback. Input is a 256-pixel fully composited
@@ -68,7 +83,7 @@ static void __attribute__((section(".time_critical.snes_blit")))
     int dev_y = (sy * 4) / 7;
     if (dev_y >= FB_H) return;
 
-    uint16_t row_blended[FB_W];
+    uint16_t row_blended[FB_W] __attribute__((aligned(4)));
     for (int ox = 0; ox < FB_W; ox++) {
         int sx  = ((ox * 7) >> 2) + FILL_X_CROP;
         int sx2 = sx + 1; if (sx2 > FILL_X_CROP + FILL_SRC - 1) sx2 = FILL_X_CROP + FILL_SRC - 1;
@@ -76,8 +91,15 @@ static void __attribute__((section(".time_critical.snes_blit")))
     }
 
     if (s_blend_a_dev_y == dev_y) {
+        /* Vertical blend path — 128 pair-aligned loads, done two pixels
+         * at a time via the packed-32 RGB565 average. s_blend_a,
+         * row_blended, and the LCD framebuffer slot are all 4-byte
+         * aligned so the uint32 load/store is safe. */
         uint16_t *out = s_lcd_target + dev_y * FB_W;
-        for (int x = 0; x < FB_W; x++) out[x] = rgb565_avg2(s_blend_a[x], row_blended[x]);
+        const uint32_t *A = (const uint32_t *)s_blend_a;
+        const uint32_t *B = (const uint32_t *)row_blended;
+        uint32_t       *O = (uint32_t       *)out;
+        for (int i = 0; i < FB_W / 2; i++) O[i] = rgb565_avg2_x2(A[i], B[i]);
         s_blend_a_dev_y = -1;
     } else {
         if (s_blend_a_dev_y >= 0 && s_blend_a_dev_y < FB_H) {

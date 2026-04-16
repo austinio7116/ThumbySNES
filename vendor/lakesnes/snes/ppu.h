@@ -252,6 +252,24 @@ struct Ppu {
    * as-is without vertical averaging). Horizontal 2-sample blend is
    * preserved; only vertical smoothing is lost. */
   uint8_t   halfVertical;
+
+  /* ThumbySNES persistent tile-row decode cache.
+   *
+   * `ppu_renderBgLine` decodes each visible tile's 8-pixel row per
+   * scanline. For repeated tiles on a line (floor/wall/sky runs) and
+   * for the same tile appearing across many scanlines when VRAM is
+   * static, this is wasted work.
+   *
+   * Direct-mapped cache keyed on (tileNum, row, bitDepth, paletteNum,
+   * hFlip) packed into a 32-bit key. Each slot stores the 8 post-
+   * palette-offset palette-index bytes. An epoch counter is bumped on
+   * every VRAM byte-write; entries are valid iff
+   * (tag == key && epoch == currentEpoch). Zero-cost invalidation —
+   * old entries automatically miss once VRAM changes. */
+  uint8_t  tileCacheData[256][8];
+  uint32_t tileCacheKey[256];
+  uint32_t tileCacheEpochStamp[256];
+  uint32_t tileCacheEpoch;
 };
 
 enum { ppu_pixelOutputFormatXBGR = 0, ppu_pixelOutputFormatBGRX = 1 };

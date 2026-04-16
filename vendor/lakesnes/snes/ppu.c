@@ -67,8 +67,18 @@ static const int spriteSizes[8][2] = {
  * input. lane[0] = MSB (pixel 0 in the tile row), lane[7] = LSB
  * (pixel 7). Used by ppu_renderBgLine and ppu_evaluateSprites tile
  * decoders to replace the 8× (shift + AND + OR) inner loop with 8
- * table-indexed reads. Fits in 2 KB flash. */
+ * table-indexed reads. Fits in 2 KB.
+ *
+ * On device builds we force the LUT into SRAM via the pico-sdk's
+ * .time_critical.* section convention (copied at boot). Tile decoders
+ * deref this 4+ times per tile; flash-XIP misses here cost ~100 cycles
+ * each. The matching macro in perf.h is `LAKESNES_HOT_SRAM=1` (set by
+ * the device CMake, unset on host). */
+#if defined(LAKESNES_HOT_SRAM) && LAKESNES_HOT_SRAM
+static uint8_t ppu_bitExpandLut[256][8] __attribute__((section(".time_critical.snes_lut")));
+#else
 static uint8_t ppu_bitExpandLut[256][8];
+#endif
 static int     ppu_bitExpandLutReady = 0;
 
 static void ppu_initBitExpandLut(void) {
@@ -113,6 +123,10 @@ Ppu* ppu_init(Snes* snes) {
   ppu->skipRender = 0;
   ppu->halfVertical = 0;
   for (int L = 0; L < 4; L++) ppu->bgLineCacheValid[L] = 0;
+  /* Tile-row decode cache. Zero stamps so lookups miss on first use.
+   * (Keys don't need resetting — epoch mismatch makes any tag stale.) */
+  memset(ppu->tileCacheEpochStamp, 0, sizeof(ppu->tileCacheEpochStamp));
+  ppu->tileCacheEpoch = 1;
   ppu_setPixelOutputFormat(ppu, ppu_pixelOutputFormatBGRX);
   return ppu;
 }
@@ -335,6 +349,13 @@ LAKESNES_HOT static void ppu_renderBgLine(Ppu* ppu, int layer, int line) {
   int tileBitsX = 3;     // simple-case path is always 8-px wide tiles
   int tileHighBitX = 0x100;
 
+  /* Precompute per-line invariants of the tile-cache key. bitDepth
+   * and tileAdrBase don't change during this line, so hoist them out
+   * of the per-tile hot loop. */
+  uint32_t tcLayerBits = ((uint32_t)((tileAdrBase >> 12) & 0xf) << 20)
+                       | ((uint32_t)(bitDepth == 2 ? 0
+                                   : bitDepth == 4 ? 1 : 2) << 24);
+
   // Determine y-row of tilemap once per line.
   uint16_t rowOffset = ((y >> tileBitsY) & 0x1f) << 5;
   bool yIntoSecondMap = (y & tileHighBitY) && tilemapHigher;
@@ -361,47 +382,84 @@ LAKESNES_HOT static void ppu_renderBgLine(Ppu* ppu, int layer, int line) {
     int row = (tile & 0x8000) ? 7 - (y & 7) : (y & 7);
     bool hFlip = (tile & 0x4000) != 0;
 
-    // Fetch plane words from VRAM once for this tile.
-    uint16_t plane1, plane2 = 0, plane3 = 0, plane4 = 0;
-    int basePl = (tileAdrBase + ((tileNum & 0x3ff) * 4 * bitDepth) + row) & 0x7fff;
-    plane1 = ppu->vram[basePl];
-    if (bitDepth > 2) plane2 = ppu->vram[(basePl + 8) & 0x7fff];
-    if (bitDepth > 4) {
-      plane3 = ppu->vram[(basePl + 16) & 0x7fff];
-      plane4 = ppu->vram[(basePl + 24) & 0x7fff];
-    }
-
-    /* Decode 8 pixels via the byte→bit-lane LUT. For 4bpp this replaces
-     * 32 shifts + 24 ANDs + 24 ORs per tile with 4 pointer derefs +
-     * 8 iterations of {4 lane reads + 3 shifts + 3 ORs}. ~2× faster
-     * per tile on M33. */
     uint8_t *dst = ppu->bgLine[layer][prio ? 1 : 0];
     int paletteOffset = paletteSize * paletteNum;
-    const uint8_t *e0 = ppu_bitExpandLut[plane1 & 0xff];
-    const uint8_t *e1 = ppu_bitExpandLut[plane1 >> 8];
-    const uint8_t *e2 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 & 0xff] : NULL;
-    const uint8_t *e3 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 >> 8]   : NULL;
-    const uint8_t *e4 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 & 0xff] : NULL;
-    const uint8_t *e5 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 >> 8]   : NULL;
-    const uint8_t *e6 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 & 0xff] : NULL;
-    const uint8_t *e7 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 >> 8]   : NULL;
-    for (int pi = 0; pi < 8; pi++) {
-      int ox = outX + pi;
-      if (ox < 0) continue;
-      if (ox >= 256) break;
-      int idx = hFlip ? (7 - pi) : pi;
-      int pixel = e0[idx] | (e1[idx] << 1);
-      if (bitDepth > 2) {
-        pixel |= (e2[idx] << 2) | (e3[idx] << 3);
+
+    /* Tile-row decode cache lookup. Key packs everything that
+     * determines the 8 output palette-index bytes. `tile & 0x5fff`
+     * extracts in one mask: tileNum (bits 0-9), paletteNum (10-12),
+     * hFlip (14). vFlip is NOT in the mask because `row` (0..7) is
+     * already the FINAL effective row after vFlip resolution — vFlip
+     * is redundant given row. Row, bitDepth, tileAdrBase fill the
+     * upper bits. tcLayerBits is precomputed per-line. */
+    uint32_t tcKey = (uint32_t)(tile & 0x5fff)
+                   | ((uint32_t)(row & 7) << 16)
+                   | tcLayerBits;
+    uint32_t tcHash = (tcKey ^ (tcKey >> 16)) & 0xff;
+    bool tcHit = (ppu->tileCacheKey[tcHash] == tcKey
+               && ppu->tileCacheEpochStamp[tcHash] == ppu->tileCacheEpoch);
+
+    if (tcHit) {
+      /* Hit: copy from cache straight through the bounds-clip + non-
+       * zero write-back. No decode, no LUT derefs, no VRAM fetch. */
+      const uint8_t *src = ppu->tileCacheData[tcHash];
+      uint8_t nonEmpty = 0;
+      for (int pi = 0; pi < 8; pi++) {
+        int ox = outX + pi;
+        if (ox < 0) continue;
+        if (ox >= 256) break;
+        uint8_t p = src[pi];
+        if (p != 0) { dst[ox] = p; nonEmpty = 1; }
       }
+      if (nonEmpty) ppu->bgLineNonEmpty[layer][prio ? 1 : 0] = 1;
+    } else {
+      /* Miss: decode as before, but FUSE the cache-store into the
+       * per-pixel loop so the miss path has no extra pass over 8
+       * pixels vs the pre-cache version. Per-pixel added cost:
+       * one uint8_t store into tcRow[pi] — trivial. */
+      uint8_t *cache = ppu->tileCacheData[tcHash];
+      uint16_t plane1, plane2 = 0, plane3 = 0, plane4 = 0;
+      int basePl = (tileAdrBase + ((tileNum & 0x3ff) * 4 * bitDepth) + row) & 0x7fff;
+      plane1 = ppu->vram[basePl];
+      if (bitDepth > 2) plane2 = ppu->vram[(basePl + 8) & 0x7fff];
       if (bitDepth > 4) {
-        pixel |= (e4[idx] << 4) | (e5[idx] << 5)
-              |  (e6[idx] << 6) | (e7[idx] << 7);
+        plane3 = ppu->vram[(basePl + 16) & 0x7fff];
+        plane4 = ppu->vram[(basePl + 24) & 0x7fff];
       }
-      if (pixel != 0) {
-        dst[ox] = (uint8_t)(paletteOffset + pixel);
-        ppu->bgLineNonEmpty[layer][prio ? 1 : 0] = 1;
+
+      const uint8_t *e0 = ppu_bitExpandLut[plane1 & 0xff];
+      const uint8_t *e1 = ppu_bitExpandLut[plane1 >> 8];
+      const uint8_t *e2 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 & 0xff] : NULL;
+      const uint8_t *e3 = (bitDepth > 2) ? ppu_bitExpandLut[plane2 >> 8]   : NULL;
+      const uint8_t *e4 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 & 0xff] : NULL;
+      const uint8_t *e5 = (bitDepth > 4) ? ppu_bitExpandLut[plane3 >> 8]   : NULL;
+      const uint8_t *e6 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 & 0xff] : NULL;
+      const uint8_t *e7 = (bitDepth > 4) ? ppu_bitExpandLut[plane4 >> 8]   : NULL;
+
+      uint8_t nonEmpty = 0;
+      for (int pi = 0; pi < 8; pi++) {
+        int ox = outX + pi;
+        int idx = hFlip ? (7 - pi) : pi;
+        int pixel = e0[idx] | (e1[idx] << 1);
+        if (bitDepth > 2) {
+          pixel |= (e2[idx] << 2) | (e3[idx] << 3);
+        }
+        if (bitDepth > 4) {
+          pixel |= (e4[idx] << 4) | (e5[idx] << 5)
+                |  (e6[idx] << 6) | (e7[idx] << 7);
+        }
+        /* Fill cache slot — final palette-indexed byte or 0. */
+        uint8_t out8 = pixel ? (uint8_t)(paletteOffset + pixel) : 0;
+        cache[pi] = out8;
+        /* Emit pixel with bounds + transparency check. */
+        if (ox >= 0 && ox < 256 && out8 != 0) {
+          dst[ox] = out8;
+          nonEmpty = 1;
+        }
       }
+      if (nonEmpty) ppu->bgLineNonEmpty[layer][prio ? 1 : 0] = 1;
+      ppu->tileCacheKey[tcHash] = tcKey;
+      ppu->tileCacheEpochStamp[tcHash] = ppu->tileCacheEpoch;
     }
 
     outX += 8;
@@ -550,6 +608,53 @@ static uint16_t ppu_composeLcdPixel(Ppu* ppu, const LcdLineCtx *ctx,
   return ppu->cgramRgb565[pixel & 0xff];
 }
 
+/* ThumbySNES: build a 256-byte window mask for one layer, replacing
+ * the per-pixel ppu_getWindowState() call inside windowed-slot
+ * composite loops. Hoists the "which windows are enabled / inversed /
+ * combine logic" branching out of the per-x loop; the inner loop
+ * body then becomes a single byte-read + branch. ~3-4× cheaper per
+ * windowed pixel than the function-call form. */
+static void ppu_buildWindowMask(Ppu* ppu, int layer, uint8_t *mask) {
+  WindowLayer *wl = &ppu->windowLayer[layer];
+  int w1L = ppu->window1left, w1R = ppu->window1right;
+  int w2L = ppu->window2left, w2R = ppu->window2right;
+  if (!wl->window1enabled && !wl->window2enabled) {
+    memset(mask, 0, 256);
+    return;
+  }
+  if (wl->window1enabled && !wl->window2enabled) {
+    bool inv = wl->window1inversed;
+    for (int x = 0; x < 256; x++) {
+      bool t = (x >= w1L && x <= w1R);
+      mask[x] = (inv ^ t) ? 1 : 0;
+    }
+    return;
+  }
+  if (!wl->window1enabled && wl->window2enabled) {
+    bool inv = wl->window2inversed;
+    for (int x = 0; x < 256; x++) {
+      bool t = (x >= w2L && x <= w2R);
+      mask[x] = (inv ^ t) ? 1 : 0;
+    }
+    return;
+  }
+  /* Both enabled — apply combine logic. */
+  bool i1 = wl->window1inversed, i2 = wl->window2inversed;
+  int logic = wl->maskLogic;
+  for (int x = 0; x < 256; x++) {
+    bool t1 = (x >= w1L && x <= w1R) ^ i1;
+    bool t2 = (x >= w2L && x <= w2R) ^ i2;
+    bool r;
+    switch (logic) {
+      case 0:  r = t1 || t2;  break;
+      case 1:  r = t1 && t2;  break;
+      case 2:  r = t1 != t2;  break;
+      default: r = t1 == t2;  break;
+    }
+    mask[x] = r ? 1 : 0;
+  }
+}
+
 /* ThumbySNES per-line full-composite fast path.
  *
  * Walks the mode's layer-slot list bottom-up (lowest z-priority first)
@@ -591,6 +696,12 @@ static void ppu_composeLineRgb565(Ppu* ppu, int y, uint16_t *out) {
     if (!ppu->layer[L].mainScreenEnabled) continue;
     bool windowed = ppu->layer[L].mainScreenWindowed;
 
+    /* When windowed, precompute a 256-byte mask once per slot. The
+     * windowed-pixel check then costs 1 byte-load + 1 compare vs the
+     * ~10-20 cycle ppu_getWindowState function call it replaces. */
+    uint8_t winMask[256];
+    if (windowed) ppu_buildWindowMask(ppu, L, winMask);
+
     if (L < 4 && ppu->bgLineCacheValid[L]) {
       /* Skip entirely if this (layer, priority) slot has no non-zero
        * pixels on this line — common enough (empty BG3 etc.) to be
@@ -606,7 +717,7 @@ static void ppu_composeLineRgb565(Ppu* ppu, int y, uint16_t *out) {
       } else {
         for (int x = 0; x < 256; x++) {
           uint8_t p = src[x];
-          if (p != 0 && !ppu_getWindowState(ppu, L, x)) out[x] = cg[p];
+          if (p != 0 && !winMask[x]) out[x] = cg[p];
         }
       }
     } else if (L == 4) {
@@ -625,7 +736,7 @@ static void ppu_composeLineRgb565(Ppu* ppu, int y, uint16_t *out) {
         }
       } else {
         for (int x = 0; x < 256; x++) {
-          if (spr[x] == P && sp[x] != 0 && !ppu_getWindowState(ppu, L, x)) {
+          if (spr[x] == P && sp[x] != 0 && !winMask[x]) {
             out[x] = cg[sp[x]];
           }
         }
@@ -634,7 +745,7 @@ static void ppu_composeLineRgb565(Ppu* ppu, int y, uint16_t *out) {
       /* BG slow path — mosaic / Mode 7 / hires / OPT. Per-x fallback
        * using the canonical helpers. Rare for target-game subset. */
       for (int x = 0; x < 256; x++) {
-        if (windowed && ppu_getWindowState(ppu, L, x)) continue;
+        if (windowed && winMask[x]) continue;
         int lx = x;
         int ly = y;
         if (ppu->bgLayer[L].mosaicEnabled && ppu->mosaicSize > 1) {
@@ -1468,12 +1579,14 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
+      ppu->tileCacheEpoch++;   /* invalidate tile-row cache */
       break;
     }
     case 0x19: {
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
+      ppu->tileCacheEpoch++;
       break;
     }
     case 0x1a: {
