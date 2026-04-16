@@ -262,25 +262,46 @@ See [`PERF.md`](PERF.md) for the full 30-item optimisation catalog
 with file:line references. [`STATUS.md`](STATUS.md) holds the current
 functional status, known bugs, and memory breakdown.
 
-### Why we can't easily reach 60 fps
+### Where time actually goes now — TBD, needs re-profile
 
-LakeSnes is a clean reference implementation focused on accuracy.
-Even after all the above, `ppu_handlePixel`-class work dominates the
-fallback paths (mosaic / mode 7 / hires / OPT). Getting meaningfully
-past 30 fps likely requires one of:
+**The historical "47% `ppu_getPixel`" profile in STATUS.md is stale.**
+That function was replaced by `ppu_composeLineRgb565` in Pass 3, and
+Pass 5 put the CPU dispatcher in hand-rolled Thumb-2. The current
+bottleneck hasn't been re-measured since those changes.
 
-1. **Tile-major PPU rewrite** — decode each tile once per scanline and
-   blit 8 pixels at a time, not pixel-at-a-time. Same architectural
-   choice snes9x2002 made for ARM handhelds. Estimated 3-5× speedup;
-   ~1-2 weeks of careful vendor surgery.
-2. **Inline WRAM path in top-4 ASM opcodes** — LDA/STA imm+abs+dp
-   hit `.Lrd`/`.Lwr` via BLX even for plain WRAM readMap hits.
-   Inlining that check saves ~6-8 cycles per opcode on ~25% of
-   executed ops. Estimated +1-2 fps. High complexity (careful ASM
-   register management).
-3. **Lower internal resolution** — render at 128×112 directly instead
-   of 256×224 + downscale. ~4× fewer pixels but requires teaching the
-   PPU half-resolution sampling. Major surgery.
+A common folk-claim — also stale — is that a "tile-major PPU rewrite"
+would give 3-5×. The quote dates to a flow where each scanline
+decoded the same tile 8 times pixel-by-pixel. We already decode
+tile-by-tile in `ppu_renderBgLine` (one decode per tile per
+scanline), and the tile-row cache added in the 2026-04-16 session
+(#27) often elides even that. A further tile-major rewrite might
+still win, but not 3-5× — and its payoff is conditional on PPU still
+being the dominant cost, which isn't currently verified.
+
+Before committing to a multi-week rewrite, we need a fresh profile.
+Likely candidates for next-big-lever (in expected-ROI order, pending
+profile):
+
+1. **Inline WRAM path in top-4 ASM opcodes** — LDA/STA imm+abs+dp
+   currently hit `.Lrd`/`.Lwr` via BLX even for plain WRAM readMap
+   hits. Inlining saves ~6-8 cycles per opcode on ~25% of executed
+   ops. Bounded ~1 day of ASM surgery. Estimated +1-2 fps.
+2. **DMA HDMA fast path** (same shape as #26 for the DMA fast path,
+   extended to HDMA). Smaller win, same shape of work.
+3. **Aggressive accuracy drops** — mode 7 as a flat BG, mosaic
+   disabled, hires modes 5/6 collapsed to mode 1, interlace off.
+   All already-known quality hits — we prefer speed over accuracy
+   for this project. Small per-game wins, low risk.
+4. **Tile-major composite** — if re-profile shows PPU composite
+   still dominant. Merge `ppu_renderBgLine` + `ppu_composeLineRgb565`
+   into one pass that emits RGB565 directly per tile, skipping the
+   256-byte `bgLine[L][P]` intermediate. Moderate win on memory
+   traffic; 2-3 days; risk of regressing modes we handle correctly
+   today.
+5. **Lower internal render resolution** — render at 128×112
+   directly instead of 256×224 + downscale. ~4× fewer output pixels
+   but requires PPU teaching half-resolution sampling. Major
+   surgery.
 
 ## ASM dispatcher debugging history (April 2026)
 

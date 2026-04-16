@@ -1,12 +1,16 @@
-# ThumbySNES — current status (2026-04-13)
+# ThumbySNES — current status (updated 2026-04-16)
 
-> **Update later on 2026-04-13**: per-line RGB565 composite + dual-core
-> APU + BG empty-slot skip landed. **Measured on device**:
-> Zelda ALTTP title ≈ **8 fps** (from ~4.8), FF II ≈ **9.6 fps** (from
-> ~5). 2×2 blend preserved — no visual compromise vs the pre-session
-> baseline. Still short of the 30 fps target; the remaining big levers
-> are a tile-major PPU rewrite and/or ARM asm for the master-cycle
-> scheduler (see "Why we can't get to 30+ fps").
+> **2026-04-16 session**: DMA fast path, persistent tile-row decode
+> cache, per-slot window-mask precompute, bit-lane LUT into SRAM,
+> packed-32 RGB565 blend landed. Host bench (FFII, Zelda, SMW, Metroid,
+> CT) shows Zelda +19%, SMW +5%, FFII +4%, Metroid +1%, CT -2% (noise).
+> Device numbers pending flash.
+>
+> **Current bottleneck profile is UNKNOWN.** The 2026-04-13 profile in
+> the "Bottleneck profile" subsection below predates both the per-line
+> RGB565 composite (Pass 3) and the Thumb-2 ASM dispatcher (Pass 5) —
+> `ppu_getPixel` and `cpu_doOpcode` are no longer in the hot path. A
+> re-profile is the prerequisite for deciding the next big lever.
 
 ## What works
 
@@ -20,8 +24,7 @@
 
 ## What doesn't work
 
-- **Super Mario World (Europe)** hangs after ~70 frames at PC=`$809D` in an SPC handshake wait loop. SPC writes `0xBB` then stops echoing past `0x0D`. Game-specific quirk we couldn't crack — Zelda EU + FFII + DKC etc all boot fine, so it's not a PAL or LoROM issue. SMW US not tested.
-- **Audio is silent** — `snes_get_audio` returns zeroes. Phase 5 work would route LakeSnes's `snes_setSamples` output through the existing PWM driver from ThumbyNES.
+- **Super Mario World (Europe)** hangs after ~70 frames at PC=`$809D` in an SPC handshake wait loop. SPC writes `0xBB` then stops echoing past `0x0D`. Game-specific quirk we couldn't crack — Zelda EU + FFII + DKC etc all boot fine, so it's not a PAL or LoROM issue. SMW US not tested. (The dual-core split may have changed this — not re-tested since.)
 - **Color math / transparency disabled** for performance. HUD fades, lantern halos, water tints render as flat colors.
 - **Mode 7** PPU paths fall through to the per-pixel slow path — works, just slowest.
 - **Enhancement chips not supported** — SuperFX (Star Fox, Yoshi's Island), SA-1 (Mario RPG, Kirby Super Star), DSP-1 (Mario Kart): LakeSnes simply doesn't implement them.
@@ -46,17 +49,23 @@ All buttons working (TBY_BTN_* namespace fix). LB+RB chord = Start / exit for br
 - **~4.8 fps** on FF II / Zelda content scenes (full-screen rendering, sprites + BGs)
 - **~9 fps** on idle / blank screens
 
-### Bottleneck profile (host gprof, M33 likely similar):
-  - 47% `ppu_getPixel` (per-pixel layer compositor, layer iteration, palette resolve)
-  - 15% `ppu_runLine` (scanline orchestration)
-  - 11% `snes_runCycles` (per-cycle scheduler)
-  - 5% `ppu_getWindowState`
-  - 4% `dsp_cycle` (audio mixing — runs even though we discard samples)
-  - 3% `cpu_doOpcode` (65816 dispatcher itself is fast)
+### Bottleneck profile — STALE (pre-pass-3, pre-pass-5)
 
-*(See `PERF.md` for the full catalog of optimizations currently active,
-grouped by category. Summary table below is chronological / highest
-impact first.)*
+The profile below is from before `ppu_composeLineRgb565` replaced
+`ppu_getPixel` (Pass 3) and before the Thumb-2 ASM dispatcher
+replaced `cpu_doOpcode` (Pass 5). Do **not** plan next-big-lever
+decisions on these numbers — re-profile first.
+
+  - 47% `ppu_getPixel`       ← function no longer in hot path
+  - 15% `ppu_runLine`
+  - 11% `snes_runCycles`
+  - 5% `ppu_getWindowState`  ← partially mitigated by window-mask precompute (#28)
+  - 4% `dsp_cycle`           ← now on core 1 (dual-core)
+  - 3% `cpu_doOpcode`        ← replaced by `cpu_runBatchAsm`
+
+*(See `PERF.md` for the full 30-item catalog of optimizations
+currently active, grouped by category. Summary table below is
+chronological / highest impact first.)*
 
 ### Optimizations applied (cumulative, in order of impact)
 
@@ -84,17 +93,35 @@ impact first.)*
 | `LAKESNES_HOT` on static functions (`ppu_getPixel`, `ppu_handlePixel`, etc.) | section attribute on inlinable statics caused boot hang — gcc generated mismatched section + inline copies |
 | `-flto` | code bloat exceeded M33's 16KB icache — slight regression |
 
-### Why we can't get to 30+ fps without bigger surgery
+### Next-big-lever candidates (pending re-profile)
 
-*(After the 2026-04-13-later pass we're measured at 8–10 fps in
-content. Getting to 30 fps still requires at least one of:)*
+See `README.md` → "Where time actually goes now — TBD, needs re-profile"
+for the up-to-date list and reasoning. The historical claim that a
+"tile-major PPU rewrite" gives 3-5× is **itself stale** — we already
+decode tile-by-tile in `ppu_renderBgLine`, and the 2026-04-16 session's
+tile-row cache (#27) often elides even that. Before picking the next
+big project, get fresh profile numbers against the ROMs we actually
+play.
 
-`ppu_handlePixel` is called 224 × 256 = ~57K times per frame. Each call iterates layer slots (4-5 in mode 1), reads VRAM + palette, writes pixelBuffer. At ~600 cycles/call on M33, that's ~34M cycles/frame just in per-pixel work — 50%+ of total. Even fully eliminating per-pixel work only gets us from ~5 fps to ~10 fps.
+What we HAVE done since the old "Real speed requires…" list:
+- **Dual-core split** landed (Pass 4, listed in table above).
+- **ARM asm for the 65816 dispatcher** landed (Pass 5, `src/cpu_asm.c`).
+- **Persistent tile-row decode cache** landed (2026-04-16, #27).
+- **Audio wired end-to-end** (DSP → PWM, runs on core 1).
 
-LakeSnes is a clean reference implementation focused on accuracy. Real speed requires:
-1. **Tile-major PPU rewrite** — decode each tile once per scanline, blit 8 pixels at a time. Same architectural choice snes9x2002 made for ARM handhelds. Estimated 3-5× speedup; ~1-2 weeks of careful vendor surgery.
-2. **Dual-core split** — SPC700 + DSP on core 1, CPU + PPU on core 0. ~20-30% additional once architecturally correct. Several days work + lock-free queue + careful timing.
-3. **Lower internal resolution** — render at 128×112 directly instead of 256×224 + downscale. ~4× fewer pixels but requires PPU teaching half-resolution sampling. Major surgery.
+What remains on the shelf, roughly ordered by expected ROI:
+1. **Inline WRAM fast path in top-4 ASM opcodes** — LDA/STA imm/abs/dp
+   currently BLX into `.Lrd`/`.Lwr` even for plain readMap hits.
+   Bounded ~1 day of ASM. Estimated +1-2 fps.
+2. **Aggressive accuracy drops** — mode 7 as flat BG, mosaic off,
+   hires collapsed to mode 1. Project policy prefers speed > accuracy;
+   small per-game wins, low risk.
+3. **Tile-major RGB565 composite** — merge `ppu_renderBgLine` +
+   `ppu_composeLineRgb565` into one pass, skipping the `bgLine[L][P]`
+   intermediate. 2-3 days. Conditional on PPU still being the
+   dominant cost.
+4. **Half-resolution internal render (128×112 native)**. Major
+   surgery; teaches the PPU half-res sampling.
 
 ## Memory
 
@@ -146,18 +173,27 @@ cmake --build build_device -j8
 
 ## Next steps (in priority order if/when picked up again)
 
-1. **Wire audio** — `snes_setSamples` → ring buffer → existing `snes_audio_pwm_push` from device layer. Phase 5 was always next.
-2. **Hunt the SMW EU hang** — probably a single 65816 opcode behaving subtly differently on M33 vs x86, or a SPC700-driver-specific quirk in the music-upload protocol. Could do bisection by stubbing SPC reads at $2140-$2143 with synthetic ack values to see how far CPU progresses.
+1. **Re-profile** against FFII gameplay + Zelda overworld with the
+   current code (post-pass-5, post-2026-04-16 session). Every
+   next-big-lever decision is blocked on this.
+2. **Hunt the SMW EU hang** — probably a single 65816 opcode behaving subtly differently on M33 vs x86, or a SPC700-driver-specific quirk in the music-upload protocol. Could do bisection by stubbing SPC reads at $2140-$2143 with synthetic ack values to see how far CPU progresses. (Dual-core split may have changed this — worth retesting.)
 3. **In-game menu** — currently MENU long-press is the only control. Needs frame skip, pause, save-state, exit options.
 4. **Save state / SRAM persistence** — LakeSnes has `snes_saveState` / `snes_loadBattery` already; just need to wire FatFs sidecars.
-5. **Performance**: see "Why we can't get to 30+ fps" above. Tile-major PPU rewrite is the highest-impact single project.
+5. **Performance**: see "Next-big-lever candidates" above. Pick from that list once the re-profile is in.
 
 ## Verdict
 
-Functional SNES emulator on stock Thumby Color hardware — fits in 520 KB SRAM, runs LoROM and HiROM games, uses the device's USB-MSC + picker UX. Audio working end-to-end. Dual-core: CPU+PPU pipeline on core 0/1, SPC+DSP on core 1 interleaved.
+Functional SNES emulator on stock Thumby Color hardware — fits in 520 KB SRAM, runs LoROM and HiROM games, uses the device's USB-MSC + picker UX. Audio working end-to-end. Dual-core: CPU + PPU pipeline split across both cores, SPC + DSP running free on core 1, CPU dispatch in hand-rolled Thumb-2 on core 0.
 
-Performance: **7-24 fps depending on scene complexity** (up from 4.8 fps baseline). Light scenes (menus, simple scroll) hit ~20 fps; heavy gameplay scenes (dense sprites, DMA) drop to ~7 fps. Turn-based RPGs (FFII, Chrono Trigger, FF Mystic Quest) are the most playable genre at these rates.
+Performance: **7-25 fps depending on scene complexity** (up from
+~4.8 fps baseline). Light scenes (menus, simple scroll) hit ~20-25
+fps; heavy gameplay scenes (dense sprites, DMA) drop to ~7-8 fps.
+Turn-based RPGs (FFII, Chrono Trigger, FF Mystic Quest) are the most
+playable genre at these rates.
 
-The remaining bottleneck is purely CPU dispatch + bus overhead on core 0 (PPU is fully hidden on core 1). The C emulation overhead ratio is ~10:1 (10 ARM instructions per SNES master cycle). Getting to 30+ fps requires ARM assembly for the 65816 dispatcher (estimated 1.5-2× on CPU) or a fundamentally different emulator architecture.
+The bottleneck is no longer known with confidence — the old
+"47% `ppu_getPixel`" profile is from before the per-line composite
+and the ASM dispatcher, so it's not a reliable guide anymore. Pick
+the next-big-lever off a fresh profile.
 
 See `PERF.md` for the complete catalog of every optimization currently active.
