@@ -177,12 +177,6 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
      * horizontal 2-sample blend for text readability; loses vertical
      * smoothing. ~43% fewer PPU line renders. */
     snes_set_half_vertical(1);
-    /* Frameskip: render only every (N+1)th frame. CPU + APU still run
-     * at full emulation rate (game logic and audio unaffected). With
-     * the dual-core SPC fix, audio plays at correct realtime pitch
-     * regardless of render rate. Adjust runtime via MENU+UP/DOWN. */
-    static int s_frameskip_setting = 1;   /* 0..2: render 1/1, 1/2, 1/3 */
-    snes_set_frameskip(s_frameskip_setting);
     /* Audio: pull stereo samples from DSP (runs on core 1) and push
      * mono to the PWM ring buffer. dsp_getSamples resamples from
      * 32040 Hz to our requested count. We ask for 367 samples/frame
@@ -231,17 +225,6 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
             int held_ms = (int)(absolute_time_diff_us(menu_press_t,
                                   get_absolute_time()) / 1000);
             if (held_ms >= MENU_HOLD_EXIT_MS) exit_pressed = 1;
-            /* MENU + UP/DOWN edge cycles frameskip. Doesn't send Start
-             * (suppresses below) so the game doesn't see a stray Start
-             * press. Up = more skip (faster, choppier), Down = less. */
-            else if (snes_buttons_just_pressed(TBY_BTN_UP) && s_frameskip_setting < 2) {
-                s_frameskip_setting++;
-                snes_set_frameskip(s_frameskip_setting);
-            }
-            else if (snes_buttons_just_pressed(TBY_BTN_DOWN) && s_frameskip_setting > 0) {
-                s_frameskip_setting--;
-                snes_set_frameskip(s_frameskip_setting);
-            }
             else                              send_start  = true;
         }
         menu_was_down = menu_now;

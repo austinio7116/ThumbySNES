@@ -82,10 +82,7 @@ struct Dsp {
   int16_t firBufferR[8];
   // sample ring buffer (1024 samples, *2 for stereo)
   int16_t sampleBuffer[0x400 * 2];
-  uint16_t sampleOffset; // current write offset in samplebuffer
-  uint16_t lastReadOffset; // last offset consumed by dsp_getSamples — used in
-                            // dual-core mode where SPC produces at wall-clock
-                            // rate independent of CPU emulation rate.
+  uint16_t sampleOffset; // current offset in samplebuffer
 };
 
 Dsp* dsp_init(Apu* apu);

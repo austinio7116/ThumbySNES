@@ -136,7 +136,6 @@ void dsp_reset(Dsp* dsp) {
   memset(dsp->firBufferR, 0, sizeof(dsp->firBufferR));
   memset(dsp->sampleBuffer, 0, sizeof(dsp->sampleBuffer));
   dsp->sampleOffset = 0;
-  dsp->lastReadOffset = 0;
 }
 
 void dsp_handleState(Dsp* dsp, StateHandler* sh) {
@@ -584,30 +583,13 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
 }
 
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame) {
-  /* In dual-core mode the SPC/DSP run free on core 1 — sampleOffset
-   * advances at SPC wall-clock rate (~32040 Hz), independent of how
-   * fast the CPU on core 0 runs. We must resample from however many
-   * samples have actually been produced since the previous call,
-   * otherwise low emulator framerates make audio play slow / wrong-
-   * pitch. Track lastReadOffset and read everything since.
-   *
-   * In single-core (apu_runCycles called per CPU opcode), the SPC and
-   * CPU advance in lockstep, and ~534/641 samples are produced per
-   * emulated frame. The same delta-based logic gives identical output
-   * for that case (delta == 534 each frame). */
-  uint16_t cur = dsp->sampleOffset;
-  uint16_t prev = dsp->lastReadOffset;
-  uint16_t produced = (uint16_t)(cur - prev);
-  /* Buffer is 1024 stereo entries — if we got further behind than that
-   * the older samples are gone. Fall back to one-frame window. */
-  float frameSamples = (dsp->apu->snes->palTiming ? 641.0f : 534.0f);
-  if (produced == 0 || produced > 0x400) produced = (uint16_t)frameSamples;
-  double adder = (double)produced / samplesPerFrame;
-  double location = (double)cur - (double)produced;
+  // resample from 534 / 641 samples per frame to wanted value
+  float wantedSamples = (dsp->apu->snes->palTiming ? 641.0 : 534.0);
+  double adder = wantedSamples / samplesPerFrame;
+  double location = dsp->sampleOffset - wantedSamples;
   for(int i = 0; i < samplesPerFrame; i++) {
     sampleData[i * 2] = dsp->sampleBuffer[(((int) location) & 0x3ff) * 2];
     sampleData[i * 2 + 1] = dsp->sampleBuffer[(((int) location) & 0x3ff) * 2 + 1];
     location += adder;
   }
-  dsp->lastReadOffset = cur;
 }
