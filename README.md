@@ -333,19 +333,41 @@ section documents how.
 | FFII first gameplay           | ~7-8   | Heavy: full BG + sprites + DMA |
 | Zelda ALTTP title/load        | ~16-20 | Medium                         |
 
-Host benchmark (`snesbench … --xip`, 900 frames × 3 reps, x86-64):
+Host benchmark (`snesbench … --xip`, 900 frames × 3 reps, x86-64).
+Two sessions of additions landed in April 2026 — shown cumulatively
+against the pre-session baseline:
 
-| ROM                | Baseline | 2026-04-16 | Δ       |
-|--------------------|---------:|-----------:|--------:|
-| Zelda ALTTP        |  438 fps |    522 fps | **+19%** |
-| SMW                |  327 fps |    344 fps | +5%     |
-| FFII               |  534 fps |    555 fps | +4%     |
-| Super Metroid      |  520 fps |    527 fps | +1%     |
-| Chrono Trigger     |  679 fps |    664 fps | –2% (noise) |
+| ROM                | Baseline | Post +26-30 | Post +31-33 | Total Δ |
+|--------------------|---------:|------------:|------------:|--------:|
+| FFII               |  534 fps |     555 fps |     893 fps | **+67%** |
+| Zelda ALTTP        |  438 fps |     522 fps |     708 fps | **+62%** |
+| SMW                |  327 fps |     344 fps |     435 fps | **+33%** |
+| Super Metroid      |  520 fps |     527 fps |     679 fps | **+31%** |
+| Chrono Trigger     |  679 fps |     664 fps |     800 fps | **+18%** |
 
-Device numbers for the 2026-04-16 session will show a larger relative
-gain than host because several of the additions only activate on
-device (LUT into SRAM, bitmask-parallel RGB565 blend).
+**The 2026-04-16 session split in two halves**:
+- **Optimisations 26-30** (DMA block-copy fast path, tile-row cache,
+  window-mask precompute, LUT-in-SRAM, packed RGB565 blend) focused
+  on collapsing redundant work inside the PPU + DMA paths.
+- **Optimisations 31-33** (`dma_handleDma` fast-exit inline,
+  `snes_runCyclesFast` inline, tile-major RGB565 composite) followed
+  a fresh re-profile that showed `ppu_runLine` at 46% and per-opcode
+  bus overhead at ~20%.
+
+The gain is **asymmetric by scene complexity** — light scenes (FFII
+title, Chrono Trigger intro) gain 50-70%; heavy gameplay scenes
+(SMW overworld, Super Metroid) gain 25-35%. This is expected: the
+per-opcode cost levers (#31, #32) save constant-rate work, but heavy
+scenes spend proportionally more time on PPU sprite eval, extra BG
+layers, and VRAM traffic — areas the 26-33 levers only partly touch.
+The next round of candidates (sprite-eval rewrite, single-walk
+tile-major, accuracy drops) is sized for the heavy end of the
+spectrum. See `PERF.md` for the full catalog and known-gaps list.
+
+Device numbers pending flash. Expect device gains to be smaller than
+host because the dual-core pipeline already hides some of core 0's
+new slack behind core 1's PPU work — L33 (tile-major composite) is
+the only lever that directly reduces core 1 cost.
 
 ### The journey, chronologically
 
@@ -449,8 +471,8 @@ took a ROM-based bisection harness to debug — see [ASM dispatcher
 debugging history](#asm-dispatcher-debugging-history-april-2026)
 below for the war story.
 
-**Session 2026-04-16 — five more levers.** Closing sub-optimisations
-collected across the codebase audit:
+**Session 2026-04-16 first half — five more levers.** Closing
+sub-optimisations collected across the codebase audit:
 
   - **DMA block-copy fast path** (`dma.c:340`). Detects the common
     DMA tile-upload pattern — WRAM/ROM A-bus → PPU `$2118`/`$2119`,
@@ -486,50 +508,111 @@ collected across the codebase audit:
     pairs per call, used by the vertical blend inner loop
     (128 pixels → 64 pair-aligned iterations).
 
-See [`PERF.md`](PERF.md) for the full 30-item optimisation catalog
+**Session 2026-04-16 second half — three profile-directed levers.**
+A fresh gprof run against the device-equivalent build
+(`THUMBYSNES_DIRECT_CPU_CALLS=1`) showed `ppu_runLine` at 46% and
+per-opcode bus overhead (DMA dispatch + cycle scheduler) at ~20%.
+Three matched levers:
+
+  - **`dma_handleDma` fast-exit inline** (`dma.h`, `dma.c`). Every
+    CPU read / write / idle calls `dma_handleDma(snes->dma, cycles)`
+    — ~40 million times per frame — and 99.9% of those calls find
+    nothing pending and immediately return. The function body was
+    renamed to `dma_handleDmaSlow`; a new `static inline` in the
+    header checks the three pending flags (`dmaState`,
+    `hdmaInitRequested`, `hdmaRunRequested`) and early-returns
+    without a function call. The slow body only runs when DMA is
+    actually active.
+
+  - **`snes_runCyclesFast` inline fast path** (`snes.h`). The
+    batched cycle scheduler spends most of its calls in the
+    trivial case "advance hPos by `cycles` within a single
+    non-event region, no IRQ edge crossed". Hoisted that case to a
+    `static inline` that falls through to the slow
+    `snes_runCycles` when any of: `hp` is at an event boundary
+    (0, 16, 512, 1104, ≥ 1356), `hp == hTimer * 4 && hIrqEnabled`,
+    `hp + cycles` crosses the next event boundary, or `hp + cycles`
+    crosses the 536 DRAM-refresh point. Wired into
+    `snes_cpuRead/Write/Idle` and `snes_flushCycles`.
+
+    *The bug story*: first cut of this fast path skipped the
+    `snes->apuCatchupCycles` update on single-core (host) builds,
+    starving the SPC of cycles. Every ROM rendered black. Fixed
+    by adding the accumulator tick inside the fast body (compiled
+    out on `THUMBYSNES_DUAL_CORE=1` where the SPC runs free on
+    core 1). Test-ROM-based bisection caught it in one flash.
+
+  - **Tile-major RGB565 composite** (`ppu.c`,
+    `ppu_emitBgSlotRgb565`). The old per-line flow wrote each BG
+    layer into a 256-byte `bgLine[L][P][x]` palette-index buffer,
+    then the compositor read it back pixel-by-pixel to produce
+    RGB565. The new emit function walks the tilemap for one
+    (layer, priority) slot and emits RGB565 directly into the
+    output line — skipping the 2 KB intermediate write-then-read
+    per slot entirely. The tile-row decode cache (#27) makes the
+    extra walk cheap: hits are 8-byte palette-offset-applied copies
+    from a pre-decoded cache slot.
+
+    Trade-off: each BG layer is now walked **twice** per line
+    (once per priority slot) vs the old one-walk-two-priorities
+    pattern, which can partially cancel the savings on scenes
+    with many unique tiles and low cache hit rate. Heavy scenes
+    gain less than light ones as a result.
+
+See [`PERF.md`](PERF.md) for the full 33-item optimisation catalog
 with file:line references. [`STATUS.md`](STATUS.md) holds the current
 functional status, known bugs, and memory breakdown.
 
-### Where time actually goes now — TBD, needs re-profile
+### Where time went, pre-L31-33 (re-profile, 2026-04-16 afternoon)
 
-**The historical "47% `ppu_getPixel`" profile in STATUS.md is stale.**
-That function was replaced by `ppu_composeLineRgb565` in Pass 3, and
-Pass 5 put the CPU dispatcher in hand-rolled Thumb-2. The current
-bottleneck hasn't been re-measured since those changes.
+Before landing the last three levers we ran a fresh gprof against
+the device-equivalent host build (`THUMBYSNES_DIRECT_CPU_CALLS=1`)
+on FFII + Zelda. Device uses the dual-core pipeline so the host
+profile only approximates device behavior, but the broad picture
+maps over:
 
-A common folk-claim — also stale — is that a "tile-major PPU rewrite"
-would give 3-5×. The quote dates to a flow where each scanline
-decoded the same tile 8 times pixel-by-pixel. We already decode
-tile-by-tile in `ppu_renderBgLine` (one decode per tile per
-scanline), and the tile-row cache added in the 2026-04-16 session
-(#27) often elides even that. A further tile-major rewrite might
-still win, but not 3-5× — and its payoff is conditional on PPU still
-being the dominant cost, which isn't currently verified.
+| % of frame time | Function | Called /frame | Notes |
+|---:|---|---:|---|
+| **46%** | `ppu_runLine` | 224 | all PPU work for one scanline |
+| 11% | `dma_handleDma` | 44 K | dispatched from every CPU access |
+| 9% | `snes_runCycles` | 23 K | batched cycle scheduler |
+| 7% | `dsp_cycle` | 500 | APU sample generation (on core 1 on device) |
+| 6% | `snes_cpuRead` | 37 K | CPU opcode bus fetch |
+| ~21% | everything else | | |
 
-Before committing to a multi-week rewrite, we need a fresh profile.
-Likely candidates for next-big-lever (in expected-ROI order, pending
-profile):
+That profile drove the three 2026-04-16-late levers (#31, #32,
+#33 — described below). The *post-*L33 profile has NOT been
+re-taken — asymmetric results by scene (light +60%, heavy +25%)
+suggest the balance has shifted, but we don't yet know where.
+**A fresh profile on a heavy-content ROM (SMW overworld, Zelda
+dungeon with rain) is the prerequisite before picking the next big
+project.**
 
-1. **Inline WRAM path in top-4 ASM opcodes** — LDA/STA imm+abs+dp
-   currently hit `.Lrd`/`.Lwr` via BLX even for plain WRAM readMap
-   hits. Inlining saves ~6-8 cycles per opcode on ~25% of executed
-   ops. Bounded ~1 day of ASM surgery. Estimated +1-2 fps.
-2. **DMA HDMA fast path** (same shape as #26 for the DMA fast path,
-   extended to HDMA). Smaller win, same shape of work.
-3. **Aggressive accuracy drops** — mode 7 as a flat BG, mosaic
-   disabled, hires modes 5/6 collapsed to mode 1, interlace off.
-   All already-known quality hits — we prefer speed over accuracy
-   for this project. Small per-game wins, low risk.
-4. **Tile-major composite** — if re-profile shows PPU composite
-   still dominant. Merge `ppu_renderBgLine` + `ppu_composeLineRgb565`
-   into one pass that emits RGB565 directly per tile, skipping the
-   256-byte `bgLine[L][P]` intermediate. Moderate win on memory
-   traffic; 2-3 days; risk of regressing modes we handle correctly
-   today.
+Candidate next levers, best guess pre-reprofile:
+
+1. **Sprite eval rewrite** — `ppu_evaluateSprites` walks all 128
+   OAM entries per line, unchanged by any of the 2026-04-16
+   additions. On heavy-sprite scenes this is the biggest known
+   untouched cost. Candidates include per-line sprite index
+   caching, sprite-tile cache paralleling (#27), or moving sprite
+   eval to core 1 ahead of the composite.
+2. **Single-walk tile-major composite** — L33 walks the tilemap
+   twice per BG layer (once per priority slot). A single-walk
+   variant emitting to two "priority strata" in one pass would
+   close the gap on layer-dense scenes where the extra walk
+   currently bites.
+3. **Aggressive accuracy drops** — mode 7 as flat BG, mosaic
+   off, hires 5/6 collapsed to mode 1, interlace off, BGRX legacy
+   path stubbed out. Speed-over-fidelity project policy; tiny
+   risk. Small per-game wins.
+4. **Inline WRAM path in top-4 ASM opcodes** — LDA/STA imm+abs+dp
+   hit `.Lrd`/`.Lwr` via BLX even for plain WRAM readMap hits.
+   Inlining saves ~6-8 cycles per opcode on ~25% of executed
+   ops. ~1 day of ASM surgery. Estimated +1-2 fps.
 5. **Lower internal render resolution** — render at 128×112
-   directly instead of 256×224 + downscale. ~4× fewer output pixels
-   but requires PPU teaching half-resolution sampling. Major
-   surgery.
+   directly instead of 256×224 + downscale. ~4× fewer output
+   pixels but requires PPU teaching half-resolution sampling.
+   Major surgery.
 
 ## ASM dispatcher debugging history (April 2026)
 

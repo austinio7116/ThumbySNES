@@ -205,22 +205,122 @@ listed here, it's in place; if not, it's either discarded (see
     and `row_blended` are 4-byte aligned. Cuts the scanline
     callback's blend cost by ~50-60%.
 
+## Post-re-profile additions (2026-04-16 late)
+
+Profile taken with device-equivalent defines
+(`THUMBYSNES_DIRECT_CPU_CALLS=1`) on FFII + Zelda showed
+`ppu_runLine` at 46% and core-0 overhead (DMA dispatch + cycle
+scheduler) at ~20%. Three matched levers landed:
+
+31. **`dma_handleDma` fast-exit inline** (`dma.h`, `dma.c`).
+    Renamed the body to `dma_handleDmaSlow` and added a static
+    inline wrapper in the header that early-returns when
+    `dmaState == 0 && !hdmaInitRequested && !hdmaRunRequested`.
+    Called ~40M times per frame from every cpu read/write/idle;
+    the overwhelming majority are no-ops but previously ate
+    function-call overhead. Now the no-op case is ~3 loads + 3
+    compares, fully inlined at the call site.
+
+32. **`snes_runCyclesFast` inline fast path** (`snes.h`).
+    Static inline that short-circuits the common
+    "cycles advance hp within a single no-event region and no
+    IRQ edge in window" case, bypassing the while-loop inside
+    `snes_runCycles`. Falls through to the slow path when:
+    - hp is currently at an event (0, 16, 512, 1104) or wrap
+      territory (≥ 1356)
+    - hp equals hTimer*4 with hIrqEnabled
+    - hp+cycles crosses the next event boundary
+    - hp+cycles crosses the 536 DRAM-refresh boundary
+    Applied to `snes_cpuRead/Write/Idle` slow paths and
+    `snes_flushCycles` (the per-opcode accumulator flush).
+
+    **Gotcha:** on single-core (host) builds, the fast body
+    still needs to update `snes->apuCatchupCycles` — skipping
+    that starved the SPC of cycles and caused every ROM to
+    render black on host. Compiled out on
+    `THUMBYSNES_DUAL_CORE=1` (device) where the SPC runs free
+    on core 1.
+
+33. **Tile-major RGB565 composite** (`ppu.c:`
+    `ppu_emitBgSlotRgb565`, replaces the bgLine reader inside
+    `ppu_composeLineRgb565`). For each (layer, priority) slot,
+    walks the tilemap and emits RGB565 pixels **directly** into
+    `lineRgb565[]` — skipping the 2 KB `bgLine[L][P]`
+    intermediate that the old flow wrote then read back.
+    Walks the tilemap twice per BG layer (once per priority
+    slot); the extra walk is cheap thanks to the tile-row
+    decode cache (#27) — cache hits elide both the VRAM reads
+    and the bit-lane expansion. `ppu_runLine` skips the
+    `ppu_renderBgLine` pre-pass when the RGB565 callback is
+    active; the legacy BGRX path still populates `bgLine[L][P]`
+    via `ppu_renderBgLine` for backward compatibility.
+
+### Post-session numbers (host, 900 frames, 3-run mean, --xip)
+
+| Scene (ROM, content)               | Pre-31-33 | Post-31-33 | Δ     |
+|------------------------------------|----------:|-----------:|------:|
+| FFII (title/map, light)            |  555 fps  |    893 fps | **+61%** |
+| Zelda ALTTP (medium)               |  522 fps  |    708 fps | **+36%** |
+| Chrono Trigger (animated title)    |  664 fps  |    800 fps | **+20%** |
+| SMW (heavy overworld)              |  344 fps  |    435 fps | **+26%** |
+| Super Metroid (heavy atmospheric)  |  527 fps  |    679 fps | **+29%** |
+
+**The improvement is asymmetric** — light scenes gain 50-60%,
+heavy scenes only 20-30%. Why: the three levers hit per-opcode
+overhead (L1, L2) and per-line compositor work (L3). Heavy
+scenes spend proportionally more time on things these levers
+don't touch:
+
+- **More sprites per line** → more OAM walks and tile decodes in
+  `ppu_evaluateSprites` (unchanged)
+- **More active BG layers** → L3's "2 tilemap walks per BG layer"
+  overhead multiplies (more walks than the old one-walk-
+  two-priorities pattern), partly cancelling the bgLine-skip win
+- **More unique tiles per line** → lower tile-cache hit rate (#27),
+  more decode work, which our extra walks amplify
+- **More VRAM traffic** from HDMA / mid-frame DMAs
+
+The next-big-lever list below is now ordered with heavy-scene
+impact in mind.
+
 ---
 
-## Known gaps (NOT yet attempted — ordered by expected impact)
+## Known gaps (NOT yet attempted — ordered for heavy-scene impact)
 
-These aren't active optimizations, listed here for honesty:
+Post-L33 the bottleneck profile has NOT been re-taken. The items
+below are guesses; whichever ones actually matter will become
+clear only from a fresh profile on a heavy-content scene (SMW
+overworld, Zelda castle interior with rain effects, FFII combat
+with full sprite set).
 
-- **Cross-core pipelining beyond APU.** Currently core 1 runs
-  SPC+DSP + PPU line composite (via `s_ppu_pipeline_line`). Sprite
-  eval could be shipped earlier as a producer ahead of the
-  compositor. Tricky timing and cross-core memory traffic; may
-  or may not win.
+- **Sprite eval rewrite.** `ppu_evaluateSprites` walks all 128
+  OAM entries per scanline, re-deriving sprite range, tile
+  index, row offset, and priority from scratch. On heavy-
+  sprite scenes it's the per-line cost that scales fastest with
+  complexity. Candidates: share a per-line "sprites-in-range"
+  index across priority slots, sprite-tile cache paralleling
+  the BG tile cache (#27), or move sprite eval to core 1 ahead
+  of the composite.
+- **Single-walk tile-major composite.** L33 walks the tilemap
+  twice per BG layer (once per priority slot). A single-walk
+  variant would emit to two output "strata" buffers in one pass,
+  or use a mask + top-down walk with early-exit when the mask
+  fills. Complexity is real; gains should show up most on
+  layer-dense scenes where the extra walk currently costs.
+- **Accuracy drops (speed-over-fidelity project policy).**
+  Mode 7 rendered as flat BG, mosaic disabled, hires modes 5/6
+  collapsed to mode 1, BGRX legacy path stubbed out. Zero-risk
+  toggles; moderate win on specific games.
 - **Inline WRAM fast path in top-4 ASM opcodes.** LDA/STA
   imm+abs+dp hit `.Lrd`/`.Lwr` via BLX even when the bus
   access is a plain WRAM/ROM readMap hit. Inlining that check
   saves ~6-8 cycles per opcode on ~25% of executed ops.
   Estimated +1-2 fps. Careful ASM register management required.
+- **Cross-core pipelining beyond APU.** Currently core 1 runs
+  SPC+DSP + PPU line composite (via `s_ppu_pipeline_line`). Sprite
+  eval could be shipped earlier as a producer ahead of the
+  compositor. Tricky timing and cross-core memory traffic; may
+  or may not win.
 - **M33 DSP intrinsics on the composite path** (`__UADD8`,
   `__SEL`, `__PKHBT`). Not currently used — the scanline blend
   uses the bitmask trick (#30) which is already tight, but
