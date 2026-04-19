@@ -120,12 +120,8 @@ static uint16_t keys_to_pad(void)
     return p;
 }
 
-static void audio_cb(void *user, Uint8 *stream, int len)
-{
-    (void)user;
-    size_t frames = len / 4; /* stereo s16 */
-    snes_get_audio((int16_t *)stream, frames);
-}
+/* audio_cb removed — we now push samples via SDL_QueueAudio from the
+ * main loop after snes_run_frame(). See the audio setup block in main(). */
 
 /* Display modes cycled with TAB:
  *   FILL — 224x224 crop → 128x128 (new default, fills the screen)
@@ -224,14 +220,40 @@ int main(int argc, char **argv)
     display_t d = {0};
     display_recreate(&d, start_mode);
 
+    /* Audio — queue mode, not callback.
+     *
+     * Previously we used SDL's callback API with want.samples = 1024 @
+     * 32040 Hz. dsp_getSamples always reads the last ~534 NTSC samples
+     * (one emulated frame) from the ring and STRETCHES them to whatever
+     * the caller requests — so 1024-sample callbacks got 534 samples of
+     * DSP content stretched 1.9×, played over 32 ms of SDL time. Between
+     * callbacks the emulator produced ~1068 more samples; half got
+     * overwritten in the ring. Net: pitch ~half, constant stutter.
+     *
+     * Queue-mode fix: open SDL without a callback, push exactly one
+     * frame's worth of samples (534 NTSC / 641 PAL) after each
+     * `snes_run_frame()`. Emulation capped at 60 fps × 534 = 32040
+     * samples/sec feeding a 32040 Hz sink — identity, no resampling.
+     * Pre-queue ~2 frames of silence so the queue doesn't underrun on
+     * the first slow frame. */
+    #define AUDIO_FRAME_SAMPLES 534   /* NTSC; could check palTiming, but LakeSnes
+                                         autodetects and dsp_getSamples uses the
+                                         matching constant internally. */
     SDL_AudioSpec want = {0}, got = {0};
     want.freq = 32040;
     want.format = AUDIO_S16SYS;
     want.channels = 2;
-    want.samples = 1024;
-    want.callback = audio_cb;
+    want.samples = AUDIO_FRAME_SAMPLES; /* SDL's internal buffer size —
+                                           not how many we push per call. */
+    want.callback = NULL;               /* queue mode */
     SDL_AudioDeviceID adev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
-    if (adev) SDL_PauseAudioDevice(adev, 0);
+    if (adev) {
+        /* Prime the queue with 2 frames of silence for underrun
+         * cushion on the first slow emulation tick. */
+        int16_t silence[AUDIO_FRAME_SAMPLES * 2 * 2] = {0};
+        SDL_QueueAudio(adev, silence, sizeof(silence));
+        SDL_PauseAudioDevice(adev, 0);
+    }
 
     int running = 1;
     Uint64 freq = SDL_GetPerformanceFrequency();
@@ -260,6 +282,24 @@ int main(int argc, char **argv)
             snes_set_skip_color_math(0);
         }
         snes_run_frame();
+
+        /* Pull one emulated frame of audio (534 NTSC stereo samples)
+         * and queue it. SDL plays at 32040 Hz. At 60 emulated fps the
+         * queue stays bounded (~1 frame = ~16 ms latency after the
+         * priming silence drains). If the queue gets big (slow scene
+         * ran faster than 60 fps somehow), drop oldest via ClearQueued. */
+        if (adev) {
+            int16_t abuf[AUDIO_FRAME_SAMPLES * 2];
+            snes_get_audio(abuf, AUDIO_FRAME_SAMPLES);
+            /* Hard cap on queued audio latency — drop if >4 frames
+             * behind so we don't drift forward indefinitely on runs
+             * that exceed realtime. */
+            uint32_t queued = SDL_GetQueuedAudioSize(adev);
+            if (queued > AUDIO_FRAME_SAMPLES * 2 * 2 * 4) {
+                SDL_ClearQueuedAudio(adev);
+            }
+            SDL_QueueAudio(adev, abuf, sizeof(abuf));
+        }
 
         const uint16_t *src;
         int pitch_bytes;
