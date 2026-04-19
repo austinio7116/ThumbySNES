@@ -111,7 +111,24 @@ static void snes_buildReadMap(Snes* snes) {
       continue;
     }
 
-    /* Banks 40-7D, C0-FF: all ROM */
+    /* Banks 40-7D, C0-FF: mostly ROM, but for LoROM $70-$7D and
+     * $F0-$FD low half ($0000-$7FFF) is cart SRAM. The fast path's
+     * readMap points at `cart->rom + off` so READS return ROM bytes
+     * — WRITES correctly fall through to the slow path (cart SRAM
+     * isn't inside `snes->ram`, so snes_cpuWrite's block-map check
+     * fails and cart_write does the right thing). But reads reading
+     * ROM instead of SRAM silently corrupt any game that persists
+     * data: Zelda ALttP's name-entry keyboard reads look up garbage,
+     * saves never round-trip. Mark those blocks SPECIAL so the slow
+     * path handles them. */
+    bool lorom_sram = (cart && cart->type == 1 && adr_base < 0x8000 &&
+                       ((bank >= 0x70 && bank < 0x7e) ||
+                        (bank >= 0xf0 /* $FE-$FF is WRAM, handled above */)));
+    if (lorom_sram) {
+      snes->readMap[block] = SNES_MAP_SPECIAL;
+      snes->readMapSpeed[block] = 8;
+      continue;
+    }
     if (cart && cart->rom && cart->romSize > 0) {
       if (cart->type == 1) { /* LoROM */
         uint32_t off = (((bank & 0x7f) << 15) | (adr_base & 0x7fff)) & (cart->romSize - 1);
@@ -200,6 +217,17 @@ void snes_handleState(Snes* snes, StateHandler* sh) {
 #define HAS_CPU_ASM 0
 #endif
 
+/* ThumbySNES: THUMBYSNES_FORCE_C_DISPATCH=1 forces the per-opcode C
+ * dispatcher (`cpu_runOpcode`) even on device builds that would
+ * otherwise use the ASM `cpu_runBatchAsm`. Used to bisect bugs that
+ * only reproduce on device (host already uses the C path via the
+ * fallback branch below). Leave undefined for production. */
+#if defined(THUMBYSNES_FORCE_C_DISPATCH) && THUMBYSNES_FORCE_C_DISPATCH
+#define USE_ASM_DISPATCH 0
+#else
+#define USE_ASM_DISPATCH (HAS_CPU_ASM && defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE)
+#endif
+
 void snes_runFrame(Snes* snes) {
   // run until we are starting a new frame (leaving vblank)
   while(snes->inVblank) {
@@ -207,7 +235,7 @@ void snes_runFrame(Snes* snes) {
   }
   // then run until we are at vblank, or we end up at next frame
   uint32_t frame = snes->frames;
-#if HAS_CPU_ASM && defined(THUMBYSNES_DUAL_CORE) && THUMBYSNES_DUAL_CORE
+#if USE_ASM_DISPATCH
   while(!snes->inVblank && frame == snes->frames) {
     cpu_runBatchAsm(snes->cpu, 64);
   }

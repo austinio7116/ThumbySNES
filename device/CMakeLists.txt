@@ -32,6 +32,11 @@ set(SNES_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
 # firmware.
 # ----------------------------------------------------------------------
 option(THUMBYSNES_LINK_CORE "Link the LakeSnes core into the firmware" OFF)
+# Diagnostic: force the per-opcode C dispatcher (cpu_runOpcode) instead of
+# the Thumb-2 ASM dispatcher (cpu_runBatchAsm) on device builds. Used to
+# bisect device-only bugs — if a game works on this build but not the
+# normal one, the bug is in cpu_asm.c. OFF for production.
+option(THUMBYSNES_FORCE_C_DISPATCH "Force C opcode dispatcher on device (diagnostic)" OFF)
 
 if(THUMBYSNES_LINK_CORE)
     set(LK_SRC ${SNES_ROOT}/vendor/lakesnes/snes)
@@ -76,6 +81,12 @@ if(THUMBYSNES_LINK_CORE)
         # cycles per call across ~1.8M calls/frame.
         THUMBYSNES_DIRECT_CPU_CALLS=1
     )
+    if(THUMBYSNES_FORCE_C_DISPATCH)
+        target_compile_definitions(lakesnes_dev PUBLIC
+            THUMBYSNES_FORCE_C_DISPATCH=1
+        )
+        message(STATUS "ThumbySNES: forcing C opcode dispatcher (diagnostic build)")
+    endif()
     target_compile_options(lakesnes_dev PRIVATE
         -O3 -fomit-frame-pointer -fstrict-aliasing
         -ffunction-sections -fdata-sections
