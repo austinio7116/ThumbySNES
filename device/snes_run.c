@@ -17,6 +17,7 @@
 #include "snes_lcd_gc9107.h"
 #include "snes_buttons.h"
 #include "snes_audio_pwm.h"
+#include "snes_xip.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -188,6 +189,10 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
 
     s_lcd_target = fb;
     s_blend_a_dev_y = -1;
+    /* XIP mode is set up by crt0 at boot (PICO_EMBED_XIP_SETUP=1 in
+     * device/CMakeLists.txt runs boot2_w25q080 before main). The
+     * Q/D/S letter in the top-left reads the live QMI RFMT so we can
+     * see the mode mid-game. */
     /* RGB565 fast-path callback — PPU composites whole lines via
      * cgramRgb565 with brightness baked in, so this path does zero
      * per-pixel channel math (just 2×2 blends + FILL 7:4 subsample). */
@@ -308,6 +313,17 @@ int snes_run_rom(const snes_rom_entry *rom, uint16_t *fb) {
         }
         if (fps_str[0]) snes_font_draw(fb, fps_str, 1, 0, 0xFFE0);
 
+        /* XIP mode indicator — "Q" (quad fast) in green, "S" (single
+         * slow) in red, "D" (dual) in yellow. Drawn to the right of
+         * the fps number. If XIP ever drops out of quad mode mid-game
+         * (e.g. because a USB MSC write broke the boot2 re-entry) the
+         * letter changes and we notice. No cost when quad. */
+        {
+            int dw = snes_xip_data_width();
+            const char *s = dw == 2 ? "Q" : dw == 1 ? "D" : "S";
+            uint16_t col = dw == 2 ? 0x07E0 : dw == 1 ? 0xFFE0 : 0xF800;
+            snes_font_draw(fb, s, 33, 0, col);
+        }
 
         snes_lcd_present(fb);
         frame++;

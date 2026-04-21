@@ -108,6 +108,7 @@ add_executable(snesrun_device
     snes_font.c
     snes_battery.c
     snes_run.c
+    snes_xip.c
     usb_descriptors.c
     fatfs/ff.c
     fatfs/ffsystem.c

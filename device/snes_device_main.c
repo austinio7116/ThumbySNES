@@ -34,6 +34,7 @@
 #include "snes_font.h"
 #include "snes_run.h"
 #include "snes_battery.h"
+#include "snes_xip.h"
 
 #if THUMBYSNES_HAVE_CORE
 #include "snes_core.h"
