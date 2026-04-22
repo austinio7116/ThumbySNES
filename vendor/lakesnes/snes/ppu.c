@@ -10,6 +10,10 @@
 #include "statehandler.h"
 #include "perf.h"
 
+/* ThumbySNES: hand-rolled Thumb-2 asm for the 8-pixel tile emit inner
+ * loop. Header-only. Falls back to C loops on non-ARM builds (host). */
+#include "../../../src/ppu_emit_asm.h"
+
 // array for layer definitions per mode:
 //   0-7: mode 0-7; 8: mode 1 + l3prio; 9: mode 7 + extbg
 
@@ -736,21 +740,34 @@ LAKESNES_HOT static void ppu_emitBgSlotRgb565(Ppu* ppu, int layer,
 
     if (tcHit) {
       const uint8_t *src = ppu->tileCacheData[tcHash];
-      if (!windowed) {
-        for (int pi = 0; pi < 8; pi++) {
-          int ox = outX + pi;
-          if (ox < 0) continue;
-          if (ox >= 256) break;
-          uint8_t p = src[pi];
-          if (p != 0) out[ox] = cg[p];
+      /* Fast path: tile fully inside [0, 256). 30-of-32 tiles per
+       * scanline hit this — 8-pixel emit becomes a straight-line
+       * unrolled Thumb-2 asm sequence (~3 instr per non-zero pixel,
+       * ~2 per zero) instead of the compiler's bounds-checked loop. */
+      if (outX >= 0 && outX + 8 <= 256) {
+        if (!windowed) {
+          ppu_emit8_nonwin(out + outX, src, cg);
+        } else {
+          ppu_emit8_windowed(out + outX, src, cg, winMask + outX);
         }
       } else {
-        for (int pi = 0; pi < 8; pi++) {
-          int ox = outX + pi;
-          if (ox < 0) continue;
-          if (ox >= 256) break;
-          uint8_t p = src[pi];
-          if (p != 0 && !winMask[ox]) out[ox] = cg[p];
+        /* Edge tile — per-pixel C with bounds check. */
+        if (!windowed) {
+          for (int pi = 0; pi < 8; pi++) {
+            int ox = outX + pi;
+            if (ox < 0) continue;
+            if (ox >= 256) break;
+            uint8_t p = src[pi];
+            if (p != 0) out[ox] = cg[p];
+          }
+        } else {
+          for (int pi = 0; pi < 8; pi++) {
+            int ox = outX + pi;
+            if (ox < 0) continue;
+            if (ox >= 256) break;
+            uint8_t p = src[pi];
+            if (p != 0 && !winMask[ox]) out[ox] = cg[p];
+          }
         }
       }
     } else {
