@@ -52,14 +52,28 @@ mounts as a USB drive in Windows; drag the `.uf2` over to flash.
 | MENU (tap)                     | SNES Start                              |
 | LB+RB chord (long-press)       | exit to ROM picker (broken-MENU units)  |
 | LB+RB chord (tap)              | SNES Start                              |
-| **MENU + UP** (edge)           | increase frameskip (0 → 1 → 2)          |
-| **MENU + DOWN** (edge)         | decrease frameskip (2 → 1 → 0)          |
 
-Default frameskip is 1 (render every other frame). The CPU and APU
-emulate at full rate regardless of frameskip — only PPU rendering is
-suppressed — so audio pitch and game logic are unaffected.
+## On-screen indicators
 
-A small FPS counter sits in the top-left corner of every game.
+Top-left corner of every game:
+
+- **FPS counter** in yellow (`14.2` etc., updated once per second,
+  drawn over the game with no background fill).
+- **XIP mode letter** right next to it:
+  - **`Q` green** — Fast Read Quad I/O (0xEB), our target mode.
+    The RP2350's W25Q080 flash supports this and the QE bit is
+    non-volatile in SR2, so once programmed it persists across
+    power cycles.
+  - **`D` yellow** — Fast Read Dual I/O (0xBB), ~2× single. Still
+    works but ~½ of quad throughput.
+  - **`S` red** — slow serial 0x03. Would be a regression.
+
+Bottom of the screen when running the dedicated `roms/test_cpu.sfc`:
+
+- **`PASS 87`** green — all 87 CPU test cases passed.
+- **`FAIL #N eXX aYY`** red — test `N` failed, expected `XX`, got
+  `YY`. The overlay only fires on the actual `'P'`/`'F'` markers
+  the test ROM writes into WRAM[0].
 
 ## Architecture
 
@@ -303,6 +317,34 @@ Register pinning:                  Bus helpers preserve:
 See the [ASM dispatcher debugging history](#asm-dispatcher-debugging-history-april-2026)
 section below for the two bugs this merge uncovered and how we
 tracked them down without a JTAG probe.
+
+### PPU emit — ARM Thumb-2 asm (inner loop)
+
+The second ASM target is the 8-pixel tile emit inner loop inside
+`ppu_emitBgSlotRgb565`'s cache-hit branch (`src/ppu_emit_asm.h`).
+That loop runs ~229K times per frame (~900 slot calls × 32 tiles ×
+8 pixels) and was GCC-compiled to ~12 Thumb-2 instructions per
+pixel. Hand-written it's ~3 per non-zero pixel, ~2 per zero:
+
+```asm
+; Input:  r0=out (u16*), r1=src (u8[8]), r2=cg (u16[256])
+; One of 8 pixel slots shown — rest are analogous, with UBFX
+; shifting the byte position and STRH with an incrementing imm8.
+ldr   s0, [src, #0]              ; bytes 0..3 packed in one 32-bit word
+ldr   s1, [src, #4]              ; bytes 4..7
+uxtb  p,  s0                     ; p = src[0]
+cbz   p,  .Lpi1                  ; zero-pixel → skip write
+ldrh  v,  [cg, p, lsl #1]        ; palette[p]
+strh  v,  [out, #0]              ; out[0]
+.Lpi1: ubfx p, s0, #8, #8        ; p = src[1]
+...
+```
+
+Two variants — `ppu_emit8_nonwin` and `ppu_emit8_windowed` — both
+require the caller to have already clipped to `outX ∈ [0, 248]`.
+The emit-slot caller routes the 30 interior tiles to the asm path
+and the 1-2 edge tiles to a bounds-checked C fallback. Cache-miss
+branch unchanged.
 
 ### Cross-core interactions
 
@@ -682,6 +724,47 @@ ldr  r3, =.Lasl_rmw8+1
 
 48 sites patched in a single regex pass.
 
+### Bug 3 — LoROM cart SRAM reads returned ROM garbage (device-only)
+
+Caught later, while investigating why Zelda ALttP's name entry on
+device showed scrambled glyphs and names wouldn't save across the
+file-select screen.
+
+Device builds enable `THUMBYSNES_DIRECT_CPU_CALLS=1`, which routes
+every CPU read through the block-map `snes->readMap[block]` before
+falling back to the slow `cart_read`. The `snes_buildReadMap`
+branch labelled `/* Banks 40-7D, C0-FF: all ROM */` pointed
+`$70-$7D:$0000-7FFF` (and `$F0-$FD` mirror) at `cart->rom + off`.
+But for LoROM carts those banks' low half is **cart SRAM**, not
+ROM:
+
+- **Writes worked** — `snes_cpuWrite`'s fast-path aborts when the
+  mapped pointer isn't inside `snes->ram`, and `cart->rom` isn't,
+  so writes fell through to `cart_write` which stored correctly
+  into `cart->ram`.
+- **Reads silently returned ROM bytes** — `snes_cpuRead`'s fast
+  path just dereferenced `cart->rom + off`, which for Zelda's
+  ~1 MB ROM aliased into random ROM data.
+
+Symptom: name-entry keyboard glyphs (rendered from tables looked up
+via SRAM reads) appeared as scrambled-looking but oddly-structured
+junk. Zelda's file-select checksum area also came back as ROM bytes
+so the save slot always appeared empty.
+
+Host wasn't affected because host builds don't enable
+`DIRECT_CPU_CALLS`, so every CPU read goes through `cart_read`
+where `cart.c:148` correctly routes `$70-$7D` to `cart->ram`.
+
+**Fix:** mark LoROM SRAM blocks (`$70-$7D` and `$F0-$FD` with
+`adr < $8000`) as `SNES_MAP_SPECIAL` in the read-map so they take
+the slow path and end up in `cart->ram` like the writes did.
+
+Diagnostic path that got us there: ruled out the ASM dispatcher
+with the `THUMBYSNES_FORCE_C_DISPATCH=1` build toggle — the Zelda
+symptom reproduced identically on a pure-C-dispatch device build,
+which put the bug outside `cpu_asm.c` entirely and pointed us at
+the bus path instead.
+
 ### Diagnostic infrastructure (compile-time, off by default)
 
 A four-field trace on the `Cpu` struct — `lastOpcode`, `lastPb`,
@@ -797,6 +880,20 @@ host keeps the classic `snes_catchupApu` per-access path where CPU
 progress drives SPC cycles. `dsp_getSamples`'s cursor-tracked
 resample still works there and behaves identically to the original
 per-frame `wantedSamples=534` flow at steady 60 fps.
+
+**Host SDL output — queue mode.** `src/snes_host_main.c` opens SDL
+audio with `callback = NULL` and pushes exactly one emulated frame
+(534 stereo samples) via `SDL_QueueAudio` after each
+`snes_run_frame()`. The callback mode we shipped originally used
+`want.samples=1024 @ 32040 Hz` and the SDL thread asked for more
+samples per callback than `dsp_getSamples` actually produced since
+last pull, so the upstream 534-sample-stretched resample dropped
+half the DSP output and played what remained at ~½ pitch with
+constant stutter. Queue-mode is identity-rate (60 × 534 = 32040
+samples/sec feeding a 32040 Hz sink) and has no thread-race window.
+Primed with 2 frames of silence for underrun cushion; capped at 4
+frames queued to prevent forward drift on runs that sustain >
+realtime.
 
 ## License
 

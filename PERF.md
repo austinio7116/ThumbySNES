@@ -255,6 +255,85 @@ scheduler) at ~20%. Three matched levers landed:
     active; the legacy BGRX path still populates `bgLine[L][P]`
     via `ppu_renderBgLine` for backward compatibility.
 
+## Post-session additions (2026-04-17/19/21)
+
+Mix of correctness fixes and a second round of ASM.
+
+36. **Hand-rolled Thumb-2 for the 8-pixel tile emit inner loop**
+    (`src/ppu_emit_asm.h`, wired into `ppu_emitBgSlotRgb565`
+    cache-hit branch in `ppu.c`). The 8-iteration C loop
+    (`for pi in [0..7]: p=src[pi]; if p: out[ox]=cg[p];`) was
+    the hottest spot in PPU compose — called ~900 times/frame
+    × 32 tiles × 8 pixels = ~229K iterations/frame. GCC compiled
+    that to ~12 Thumb-2 instructions per pixel (bounds check +
+    palette load + conditional store). The ASM version:
+    - Loads 8 cached palette-index bytes via **two aligned
+      LDR's** (not LDRD — tile-cache entries aren't guaranteed
+      8-byte aligned in the Ppu struct).
+    - Extracts each byte with **UBFX** from the packed 32-bit
+      word — no shift+mask chain.
+    - **CBZ** for the zero-pixel early-skip, which dominates
+      sprite-heavy scenes (transparent SNES pixel 0 is common).
+    - **LDRH [cg, p, LSL #1]** in one instruction for palette
+      lookup, **STRH [out, #imm]** with pre-computed offsets.
+    - Uses named labels + `%=` suffix for correct GCC-inline
+      behavior across multiple callsites.
+    Two entry points — `ppu_emit8_nonwin` and `ppu_emit8_windowed`
+    — both require caller to have clipped to `outX >= 0 &&
+    outX + 8 <= 256`. Interior tiles (30 of 32 per slot) take
+    the fast path; edge tiles stay on the bounds-checked C
+    loop. Cache-miss branch unchanged. ~3 instr per non-zero
+    pixel, ~2 per zero — roughly 60% fewer instructions than
+    the GCC-compiled C on the dominant cache-hit path.
+
+37. **LoROM cart SRAM read block-map fix**
+    (`vendor/lakesnes/snes/snes.c:snes_buildReadMap`). Device
+    builds enable `THUMBYSNES_DIRECT_CPU_CALLS=1` which routes
+    CPU reads through `snes->readMap[]` before falling back to
+    the slow `cart_read`. The "Banks 40-7D, C0-FF: all ROM"
+    branch pointed `$70-$7D:0000-7FFF` (and `$F0-$FD` mirror)
+    at `cart->rom`, so LoROM SRAM **reads** returned ROM
+    garbage. Writes always worked (fell through to `cart_write`
+    because SRAM isn't inside `snes->ram`). Zelda ALttP's name-
+    entry keyboard read lookup tables got garbage, and saves
+    never round-tripped because the checksum area read back as
+    ROM bytes. **Fix:** mark LoROM SRAM blocks as
+    `SNES_MAP_SPECIAL` so the slow path handles reads. Host
+    was unaffected because host doesn't enable
+    `DIRECT_CPU_CALLS`.
+
+38. **XIP mode indicator** (`device/snes_xip.{c,h}` +
+    overlay letter in `device/snes_run.c`). Reads
+    `qmi_hw->m[0].rfmt.DATA_WIDTH` and draws one of **`Q`**
+    (quad, green), **`D`** (dual, yellow), **`S`** (single,
+    red) at the top-left next to the FPS counter. Not a perf
+    lever per se — just a live confirmation that flash XIP is
+    in the expected fast mode. The W25Q080's QE bit is in
+    non-volatile SR2; once programmed by any boot2 run it
+    persists across power cycles, so the RP2350 bootrom's
+    default XIP init + quad-capable flash = `Q` most of the
+    time. Also ships a `snes_xip_rerun_boot2()` that re-applies
+    the ThumbyOne-style W25Q 66h/99h reset + quad QMI
+    configure; NOT currently called (tried it as both a
+    game-launch call and pre-main constructor; both hang on
+    our specific flash state — direct-boot + dual baseline is
+    different from ThumbyOne's chained-boot + continuous-mode
+    state and the reset-then-configure path doesn't recover
+    cleanly here). Kept available for future work.
+
+### Practical FPS impact of 36 on device
+
+Measured on-device the hot-scene FPS bump from the emit-ASM
+is modest because (a) the hot paths were already in SRAM via
+`.time_critical.snes`, removing flash-XIP misses that would
+have made ASM a bigger win, and (b) core-1 PPU compose already
+overlaps with core-0 CPU, so reducing core-1 cost only moves
+the bar until core-0 becomes the critical path. On light
+scenes (already fast) the change is invisible. On PPU-bound
+scenes the win is in the few-percent range. **Re-profile on
+device is the prerequisite for deciding the next big lever**
+— the last profile predates L36.
+
 ## Audio quality fixes (not perf, but related)
 
 These don't change fps; they fix audio quality issues caused by
@@ -300,6 +379,23 @@ symptoms look like perf bugs (audio pitch drifting).
     `INTERFACE_INCLUDE_DIRECTORIES` (linking the library would
     pull in its .c files which won't compile without
     `pico_sdk_init`).
+
+35.5. **Host SDL queue-mode audio** (`src/snes_host_main.c`).
+    The SDL callback mode opened at `want.samples=1024 @
+    32040 Hz` called `snes_get_audio(1024)` every ~32 ms.
+    Upstream `dsp_getSamples` always reads the LAST 534 NTSC
+    samples from the ring and RESAMPLES them to the caller's
+    requested count — so 1024-sample callbacks got 534 samples
+    of DSP content stretched 1.9× over 32 ms of SDL time,
+    while between callbacks the emulator produced ~1068 samples
+    and half were overwritten in the ring. Net: audio played
+    at ~half pitch with constant stutter. **Fix:** open SDL
+    without a callback and push exactly one emulated frame's
+    worth (534 stereo samples) via `SDL_QueueAudio` after every
+    `snes_run_frame()`. Identity resampling, no thread races.
+    Pre-queued 2 frames of silence for underrun cushion, capped
+    queued audio at 4 frames to prevent forward drift on runs
+    that sustain > realtime.
 
 ### Post-session numbers (host, 900 frames, 3-run mean, --xip)
 
